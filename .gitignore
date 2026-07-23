@@ -1,0 +1,20 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Credentials
+.env
+
+# Local downloads and database
+downloads/
+*.db
+*.sqlite
+
+# Python cache & build files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temp files
+*.tmp
