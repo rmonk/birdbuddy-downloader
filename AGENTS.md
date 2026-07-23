@@ -25,6 +25,7 @@ This document provides architectural context, development guidelines, CLI flags,
 ```text
 birdbuddy-downloader/
 ├── AGENTS.md                  # Context & guidelines for AI agents
+├── LICENSE                    # MIT License file
 ├── README.md                  # End-user documentation
 ├── downloader.py              # Main Python application entry point
 ├── requirements.txt           # Python dependency requirements

@@ -247,3 +247,9 @@ WantedBy=timers.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now birdbuddy-downloader.timer
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
