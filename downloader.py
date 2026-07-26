@@ -937,6 +937,28 @@ def str_to_bool(val: str | None, default: bool = False) -> bool:
     return str(val).strip().lower() in ("true", "1", "yes", "on", "t", "y")
 
 
+def str_to_int(val: str | None, default: int = 0) -> int:
+    """Convert string environment variable to integer safely."""
+    if val is None or val == "":
+        return default
+    try:
+        clean_val = str(val).split("#")[0].strip()
+        return int(clean_val)
+    except (ValueError, TypeError):
+        return default
+
+
+def str_to_float(val: str | None, default: float = 0.0) -> float:
+    """Convert string environment variable to float safely."""
+    if val is None or val == "":
+        return default
+    try:
+        clean_val = str(val).split("#")[0].strip()
+        return float(clean_val)
+    except (ValueError, TypeError):
+        return default
+
+
 def parse_args():
     # Pre-parse --env-file to load .env before establishing parameter defaults
     env_parser = argparse.ArgumentParser(add_help=False)
@@ -969,13 +991,13 @@ def parse_args():
     parser.add_argument(
         "--buffer-hours",
         type=float,
-        default=float(os.getenv("BUFFER_HOURS", "2.0")),
+        default=str_to_float(os.getenv("BUFFER_HOURS"), 2.0),
         help="Hours before latest downloaded detection to start fetching feed items (default: 2.0 or BUFFER_HOURS env var)",
     )
     parser.add_argument(
         "--db-retention-days",
         type=int,
-        default=int(os.getenv("DB_RETENTION_DAYS", "14")),
+        default=str_to_int(os.getenv("DB_RETENTION_DAYS"), 14),
         help="Days to retain records in database before cleanup (default: 14 or DB_RETENTION_DAYS env var; set to 0 to disable)",
     )
     parser.add_argument(
@@ -984,8 +1006,8 @@ def parse_args():
         default=str_to_bool(os.getenv("FULL_SYNC", "false")),
         help="Bypass latest detection cutoff and perform a full feed sync",
     )
-    parser.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL", "0")), help="Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)")
-    parser.add_argument("--max-pages", type=int, default=int(os.getenv("MAX_PAGES", "0")), help="Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)")
+    parser.add_argument("--interval", type=int, default=str_to_int(os.getenv("INTERVAL"), 0), help="Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)")
+    parser.add_argument("--max-pages", type=int, default=str_to_int(os.getenv("MAX_PAGES"), 0), help="Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)")
     parser.add_argument("--no-images", action="store_true", default=str_to_bool(os.getenv("NO_IMAGES", "false")), help="Skip downloading image files")
     parser.add_argument("--no-videos", action="store_true", default=str_to_bool(os.getenv("NO_VIDEOS", "false")), help="Skip downloading video files")
     parser.add_argument("--feeder-filter", default=os.getenv("FEEDER_FILTER"), help="Filter downloads by feeder name (case-insensitive substring)")
@@ -1023,18 +1045,14 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        if args.dry_run:
-            logger.info("Starting Bird Buddy Downloader (Dry-Run mode)...")
+        mode_label = " (Dry-Run mode)" if args.dry_run else ""
+        if args.interval <= 0:
+            logger.info(f"Starting Bird Buddy Downloader (Single Run mode){mode_label}...")
             await downloader.run_once()
             if not downloader.stop_requested:
-                logger.info("Dry-Run completed!")
-        elif args.interval <= 0:
-            logger.info("Starting Bird Buddy Downloader (Single Run mode)...")
-            await downloader.run_once()
-            if not downloader.stop_requested:
-                logger.info("Done!")
+                logger.info(f"Done{mode_label}!")
         else:
-            logger.info(f"Starting Bird Buddy Downloader in Continuous Daemon mode (Interval: {args.interval}s)...")
+            logger.info(f"Starting Bird Buddy Downloader in Continuous Daemon mode (Interval: {args.interval}s){mode_label}...")
             while not downloader.stop_requested:
                 try:
                     await downloader.run_once()
