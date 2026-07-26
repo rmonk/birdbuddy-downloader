@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   birdbuddy-downloader:
+    image: docker.io/moosemouse/birdbuddy-downloader:latest
     build:
       context: .
       dockerfile: Containerfile
