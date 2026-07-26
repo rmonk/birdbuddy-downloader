@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  birdbuddy-downloader:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: birdbuddy-downloader
+    env_file:
+      - .env
+    environment:
+      - DOWNLOAD_DIR=/app/downloads
+      - DB_PATH=/app/data/birdbuddy_downloader.db
+    volumes:
+      - ./downloads:/app/downloads:z
+      - ./data:/app/data:z
+    restart: unless-stopped

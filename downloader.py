@@ -928,51 +928,71 @@ def print_info_report(info: dict, as_json: bool = False):
     print("=" * 80 + "\n")
 
 
+def str_to_bool(val: str | None, default: bool = False) -> bool:
+    """Convert string environment variable or value to boolean."""
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes", "on", "t", "y")
+
+
 def parse_args():
+    # Pre-parse --env-file to load .env before establishing parameter defaults
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument("--env-file", default=os.getenv("ENV_FILE", ".env"))
+    known_args, _ = env_parser.parse_known_args()
+
+    if os.path.exists(known_args.env_file):
+        load_dotenv(known_args.env_file)
+
     parser = argparse.ArgumentParser(
         description="Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, and feeder info."
     )
-    parser.add_argument("--env-file", default=".env", help="Path to .env file containing credentials (default: .env)")
-    parser.add_argument("--username", help="Bird Buddy account email (overrides .env)")
-    parser.add_argument("--password", help="Bird Buddy account password (overrides .env)")
-    parser.add_argument("--download-dir", default="./downloads", help="Directory to save downloaded media (default: ./downloads)")
-    parser.add_argument("--db-path", default="./birdbuddy_downloader.db", help="SQLite DB path for de-duplication (default: ./birdbuddy_downloader.db)")
+    parser.add_argument("--env-file", default=known_args.env_file, help="Path to .env file containing credentials (default: .env)")
+    parser.add_argument("--username", default=os.getenv("USERNAME"), help="Bird Buddy account email (overrides USERNAME env var)")
+    parser.add_argument("--password", default=os.getenv("PASSWORD"), help="Bird Buddy account password (overrides PASSWORD env var)")
+    parser.add_argument("--download-dir", default=os.getenv("DOWNLOAD_DIR", "./downloads"), help="Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)")
+    parser.add_argument("--db-path", default=os.getenv("DB_PATH", "./data/birdbuddy_downloader.db"), help="SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)")
     parser.add_argument(
         "--dir-template",
+        default=os.getenv("DIR_TEMPLATE", "{feeder_name}/{species_name}"),
         help="Template for output subdirectories relative to download-dir (default: '{feeder_name}/{species_name}'). "
              "Variables: feeder_name, species_name, owner_name, detection_id, postcard_id, sighting_id, year, month, day, hour, minute, second, date, iso_date, time, etc.",
     )
     parser.add_argument(
         "--filename-template",
+        default=os.getenv("FILENAME_TEMPLATE", "{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}"),
         help="Template for output filenames (default: '{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}'). "
              "Variables: year, month, day, hour, minute, second, date, time, media_id_short, detection_id_short, postcard_id_short, feeder_name, species_name, ext, etc.",
     )
     parser.add_argument(
         "--buffer-hours",
         type=float,
-        default=2.0,
-        help="Hours before latest downloaded detection to start fetching feed items (default: 2.0)",
+        default=float(os.getenv("BUFFER_HOURS", "2.0")),
+        help="Hours before latest downloaded detection to start fetching feed items (default: 2.0 or BUFFER_HOURS env var)",
     )
     parser.add_argument(
         "--db-retention-days",
         type=int,
-        default=14,
-        help="Days to retain records in database before cleanup (default: 14; set to 0 to disable)",
+        default=int(os.getenv("DB_RETENTION_DAYS", "14")),
+        help="Days to retain records in database before cleanup (default: 14 or DB_RETENTION_DAYS env var; set to 0 to disable)",
     )
     parser.add_argument(
         "--full-sync",
         action="store_true",
+        default=str_to_bool(os.getenv("FULL_SYNC", "false")),
         help="Bypass latest detection cutoff and perform a full feed sync",
     )
-    parser.add_argument("--interval", type=int, default=0, help="Interval in seconds for continuous polling mode (0 for single run)")
-    parser.add_argument("--max-pages", type=int, default=0, help="Maximum feed pages to fetch (0 for unlimited)")
-    parser.add_argument("--no-images", action="store_true", help="Skip downloading image files")
-    parser.add_argument("--no-videos", action="store_true", help="Skip downloading video files")
-    parser.add_argument("--feeder-filter", help="Filter downloads by feeder name (case-insensitive substring)")
-    parser.add_argument("--dry-run", action="store_true", help="Perform a dry run without downloading files or modifying database")
-    parser.add_argument("--info", action="store_true", help="Display feeder information, battery status, species media counts, and event date ranges")
-    parser.add_argument("--json", action="store_true", help="Output --info as raw JSON")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL", "0")), help="Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)")
+    parser.add_argument("--max-pages", type=int, default=int(os.getenv("MAX_PAGES", "0")), help="Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)")
+    parser.add_argument("--no-images", action="store_true", default=str_to_bool(os.getenv("NO_IMAGES", "false")), help="Skip downloading image files")
+    parser.add_argument("--no-videos", action="store_true", default=str_to_bool(os.getenv("NO_VIDEOS", "false")), help="Skip downloading video files")
+    parser.add_argument("--feeder-filter", default=os.getenv("FEEDER_FILTER"), help="Filter downloads by feeder name (case-insensitive substring)")
+    parser.add_argument("--dry-run", action="store_true", default=str_to_bool(os.getenv("DRY_RUN", "false")), help="Perform a dry run without downloading files or modifying database")
+    parser.add_argument("--info", action="store_true", default=str_to_bool(os.getenv("INFO", "false")), help="Display feeder information, battery status, species media counts, and event date ranges")
+    parser.add_argument("--json", action="store_true", default=str_to_bool(os.getenv("JSON", "false")), help="Output --info as raw JSON")
+    parser.add_argument("-v", "--verbose", action="store_true", default=str_to_bool(os.getenv("VERBOSE", "false")), help="Enable debug logging")
     return parser.parse_args()
 
 
@@ -981,9 +1001,6 @@ async def main():
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-
-    if os.path.exists(args.env_file):
-        load_dotenv(args.env_file)
 
     conn = init_db(args.db_path)
     downloader = BirdBuddyDownloader(args, conn)

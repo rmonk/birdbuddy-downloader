@@ -70,6 +70,40 @@ PASSWORD="your_password"
 
 ---
 
+## Container Deployment (Podman / Docker)
+
+You can run `birdbuddy-downloader` in a container using **Podman** or **Docker**.
+
+### 1. Configure `.env`
+Ensure your `.env` file contains your credentials and desired options:
+```env
+USERNAME="your_email@example.com"
+PASSWORD="your_password"
+INTERVAL=3600  # Set to >0 for continuous polling mode in container
+```
+
+### 2. Run with `podman-compose` or `docker compose`
+Build and launch the container in background mode:
+```bash
+# Using podman-compose
+podman-compose up -d --build
+
+# Using docker compose
+docker compose up -d --build
+```
+
+### 3. Run single commands or dry-runs via container
+```bash
+# Build image manually
+podman build -t birdbuddy-downloader -f Containerfile .
+
+# Run dry-run via container
+podman run --rm --env-file .env \
+  -v ./downloads:/app/downloads:z \
+  -v ./data:/app/data:z \
+  birdbuddy-downloader --dry-run
+```
+
 ## Output Path & Filename Templating
 
 You can define custom directory structures and filenames using `--dir-template` and `--filename-template` flags (or `DIR_TEMPLATE` and `FILENAME_TEMPLATE` in `.env`).
