@@ -130,8 +130,9 @@ CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
 
 When making code edits or refactoring, verify the following:
 
-1. **Syntax & Imports**:
+1. **Syntax, Imports & Black Formatting**:
    ```bash
+   ./venv/bin/black --check .
    ./venv/bin/python3 -c "import downloader; print('OK')"
    ```
 2. **Dry Run & Incremental Cutoff**:
@@ -147,5 +148,5 @@ When making code edits or refactoring, verify the following:
    ./venv/bin/python3 downloader.py --info
    ./venv/bin/python3 downloader.py --info --json
    ```
-5. **Signal Handling (Ctrl-C)**:
-   Verify that sending `SIGINT` (signal 2) immediately halts loop execution and closes the database cleanly without hanging or leaving `.tmp` files behind.
+5. **Git Branching & Pre-Commit Hook**:
+   Always create a dedicated feature branch for new work. The pre-commit hook runs `leaktk` and `black --check .` before allowing any commit to proceed.
