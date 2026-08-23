@@ -44,7 +44,9 @@ try:
     from birdbuddy.feed import FeedNodeType
     from birdbuddy.queries import me as me_queries
 except ImportError:
-    print("Error: pybirdbuddy package not found. Please install requirements.txt first.")
+    print(
+        "Error: pybirdbuddy package not found. Please install requirements.txt first."
+    )
     sys.exit(1)
 
 # Set up logging
@@ -153,7 +155,9 @@ def cleanup_old_db_records(conn: sqlite3.Connection, retention_days: int = 14) -
             to_delete.append(media_id)
 
     if to_delete:
-        cursor.executemany("DELETE FROM downloaded_media WHERE media_id = ?", [(m,) for m in to_delete])
+        cursor.executemany(
+            "DELETE FROM downloaded_media WHERE media_id = ?", [(m,) for m in to_delete]
+        )
         conn.commit()
     return len(to_delete)
 
@@ -219,7 +223,11 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
             "past_hour": {"images": h_img, "videos": h_vid, "total": h_img + h_vid},
             "past_day": {"images": d_img, "videos": d_vid, "total": d_img + d_vid},
             "past_week": {"images": w_img, "videos": w_vid, "total": w_img + w_vid},
-            "all_time": {"images": tot_img, "videos": tot_vid, "total": tot_img + tot_vid},
+            "all_time": {
+                "images": tot_img,
+                "videos": tot_vid,
+                "total": tot_img + tot_vid,
+            },
             "latest_download": latest_dl,
         }
 
@@ -240,14 +248,12 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
         totals["all_time"]["total"] += tot_img + tot_vid
 
     # Recent downloads
-    cursor.execute(
-        """
+    cursor.execute("""
         SELECT media_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path
         FROM downloaded_media
         ORDER BY downloaded_at DESC
         LIMIT 15
-        """
-    )
+        """)
     recent_rows = cursor.fetchall()
     recent_downloads = []
     for r in recent_rows:
@@ -332,7 +338,9 @@ async def download_file(url: str, dest_path: str, stop_checker=None) -> bool:
                 with open(temp_path, "wb") as f:
                     while True:
                         if stop_checker and stop_checker():
-                            logger.info("Download cancelled mid-stream due to stop request.")
+                            logger.info(
+                                "Download cancelled mid-stream due to stop request."
+                            )
                             f.close()
                             if os.path.exists(temp_path):
                                 os.remove(temp_path)
@@ -548,11 +556,17 @@ class BirdBuddyDownloader:
                 success = await self.bb.refresh()
                 if success:
                     self.feeders_map = self.bb.feeders or {}
-                    logger.debug("Successfully refreshed existing Bird Buddy session and feeder data.")
+                    logger.debug(
+                        "Successfully refreshed existing Bird Buddy session and feeder data."
+                    )
                     return True
-                logger.warning("Session refresh returned False; re-authenticating with credentials...")
+                logger.warning(
+                    "Session refresh returned False; re-authenticating with credentials..."
+                )
             except Exception as e:
-                logger.warning(f"Session refresh failed ({e}); re-authenticating with credentials...")
+                logger.warning(
+                    f"Session refresh failed ({e}); re-authenticating with credentials..."
+                )
 
         # Create new BirdBuddy instance and perform full authentication
         logger.info(f"Authenticating with Bird Buddy account: {username}")
@@ -565,7 +579,9 @@ class BirdBuddyDownloader:
                 return False
 
             self.feeders_map = self.bb.feeders or {}
-            logger.info(f"Successfully authenticated! Found {len(self.feeders_map)} connected camera feeder(s):")
+            logger.info(
+                f"Successfully authenticated! Found {len(self.feeders_map)} connected camera feeder(s):"
+            )
             for fid, fdata in self.feeders_map.items():
                 name = fdata.get("name", "Unnamed Feeder")
                 owner = fdata.get("ownerName", "Unknown Owner")
@@ -603,7 +619,9 @@ class BirdBuddyDownloader:
 
         dt = parse_iso_datetime(created_at_str)
 
-        owner_name = owner_name or self.feeders_map.get(feeder_id, {}).get("ownerName", "Unknown Owner")
+        owner_name = owner_name or self.feeders_map.get(feeder_id, {}).get(
+            "ownerName", "Unknown Owner"
+        )
         t_vars = build_template_vars(
             media_id=media_id,
             media_type=media_type,
@@ -623,12 +641,25 @@ class BirdBuddyDownloader:
             template_vars=t_vars,
         )
 
-        already_downloaded = is_media_downloaded(self.conn, media_id) or os.path.exists(dest_path)
+        already_downloaded = is_media_downloaded(self.conn, media_id) or os.path.exists(
+            dest_path
+        )
 
         if already_downloaded:
-            if not is_media_downloaded(self.conn, media_id) and os.path.exists(dest_path) and not self.args.dry_run:
+            if (
+                not is_media_downloaded(self.conn, media_id)
+                and os.path.exists(dest_path)
+                and not self.args.dry_run
+            ):
                 record_media_downloaded(
-                    self.conn, media_id, feeder_id, feeder_name, species_name, media_type, created_at_str, dest_path
+                    self.conn,
+                    media_id,
+                    feeder_id,
+                    feeder_name,
+                    species_name,
+                    media_type,
+                    created_at_str,
+                    dest_path,
                 )
             logger.debug(f"Media {media_id} already downloaded. Skipping.")
             return "skipped"
@@ -639,13 +670,26 @@ class BirdBuddyDownloader:
             )
             return "would_download"
 
-        logger.info(f"Downloading [{media_type.upper()}] from '{feeder_name}' ({species_name}): {filename}")
-        success = await download_file(content_url, dest_path, stop_checker=lambda: self.stop_requested)
+        logger.info(
+            f"Downloading [{media_type.upper()}] from '{feeder_name}' ({species_name}): {filename}"
+        )
+        success = await download_file(
+            content_url, dest_path, stop_checker=lambda: self.stop_requested
+        )
         if success and not self.stop_requested:
             if dt:
-                apply_timestamps_and_exif(dest_path, dt, is_image=(media_type == "image"))
+                apply_timestamps_and_exif(
+                    dest_path, dt, is_image=(media_type == "image")
+                )
             record_media_downloaded(
-                self.conn, media_id, feeder_id, feeder_name, species_name, media_type, created_at_str, dest_path
+                self.conn,
+                media_id,
+                feeder_id,
+                feeder_name,
+                species_name,
+                media_type,
+                created_at_str,
+                dest_path,
             )
             logger.info(f"Successfully downloaded and timestamped: {dest_path}")
             return "downloaded"
@@ -708,7 +752,11 @@ class BirdBuddyDownloader:
                 node_created_at = node.created_at
 
                 # Stop pagination if node is older than feed_cutoff_dt
-                if feed_cutoff_dt and node_created_at and node_created_at < feed_cutoff_dt:
+                if (
+                    feed_cutoff_dt
+                    and node_created_at
+                    and node_created_at < feed_cutoff_dt
+                ):
                     logger.info(
                         f"Reached feed item created at {node_created_at.isoformat()}, "
                         f"which is older than cutoff {feed_cutoff_dt.isoformat()}. Stopping feed pagination."
@@ -725,13 +773,26 @@ class BirdBuddyDownloader:
                         feeder_info = (sighting.feeder if sighting else {}) or {}
                         feeder_id = feeder_info.get("id", "unknown_feeder")
                         feeder_name = feeder_info.get("name", "Unknown Feeder")
-                        owner_name = feeder_info.get("ownerName") or self.feeders_map.get(feeder_id, {}).get("ownerName", "Unknown Owner")
+                        owner_name = feeder_info.get(
+                            "ownerName"
+                        ) or self.feeders_map.get(feeder_id, {}).get(
+                            "ownerName", "Unknown Owner"
+                        )
 
                         sighting_id = None
-                        if sighting and hasattr(sighting, "report") and sighting.report and sighting.report.sightings:
+                        if (
+                            sighting
+                            and hasattr(sighting, "report")
+                            and sighting.report
+                            and sighting.report.sightings
+                        ):
                             sighting_id = sighting.report.sightings[0].id
 
-                        if self.args.feeder_filter and self.args.feeder_filter.lower() not in feeder_name.lower():
+                        if (
+                            self.args.feeder_filter
+                            and self.args.feeder_filter.lower()
+                            not in feeder_name.lower()
+                        ):
                             continue
 
                         species_name = extract_species_name(sighting)
@@ -747,9 +808,22 @@ class BirdBuddyDownloader:
                                     if hasattr(m, "created_at") and m.created_at
                                     else m.get("createdAt")
                                 )
-                                content_url = m.content_url if hasattr(m, "content_url") else m.get("contentUrl")
+                                content_url = (
+                                    m.content_url
+                                    if hasattr(m, "content_url")
+                                    else m.get("contentUrl")
+                                )
                                 status = await self.process_media_item(
-                                    mid, "image", content_url, created_at, feeder_name, feeder_id, species_name, owner_name, postcard_id, sighting_id
+                                    mid,
+                                    "image",
+                                    content_url,
+                                    created_at,
+                                    feeder_name,
+                                    feeder_id,
+                                    species_name,
+                                    owner_name,
+                                    postcard_id,
+                                    sighting_id,
                                 )
                                 if status == "downloaded":
                                     total_downloaded += 1
@@ -759,7 +833,11 @@ class BirdBuddyDownloader:
                                     total_skipped += 1
 
                         # Process video media
-                        if sighting and hasattr(sighting, "video_media") and sighting.video_media:
+                        if (
+                            sighting
+                            and hasattr(sighting, "video_media")
+                            and sighting.video_media
+                        ):
                             for vm in sighting.video_media:
                                 if self.stop_requested:
                                     break
@@ -769,9 +847,22 @@ class BirdBuddyDownloader:
                                     if hasattr(vm, "created_at") and vm.created_at
                                     else vm.get("createdAt")
                                 )
-                                content_url = vm.content_url if hasattr(vm, "content_url") else vm.get("contentUrl")
+                                content_url = (
+                                    vm.content_url
+                                    if hasattr(vm, "content_url")
+                                    else vm.get("contentUrl")
+                                )
                                 status = await self.process_media_item(
-                                    vmid, "video", content_url, created_at, feeder_name, feeder_id, species_name, owner_name, postcard_id, sighting_id
+                                    vmid,
+                                    "video",
+                                    content_url,
+                                    created_at,
+                                    feeder_name,
+                                    feeder_id,
+                                    species_name,
+                                    owner_name,
+                                    postcard_id,
+                                    sighting_id,
                                 )
                                 if status == "downloaded":
                                     total_downloaded += 1
@@ -795,7 +886,9 @@ class BirdBuddyDownloader:
                     if "media" in node and node["media"]:
                         medias.append(node["media"])
 
-                    species_info = node.get("species", {}) or node.get("collection", {}).get("species", {})
+                    species_info = node.get("species", {}) or node.get(
+                        "collection", {}
+                    ).get("species", {})
                     species_name = (
                         species_info.get("name", "Unrecognized Species")
                         if isinstance(species_info, dict)
@@ -816,7 +909,15 @@ class BirdBuddyDownloader:
                         feeder_id = "feed"
 
                         status = await self.process_media_item(
-                            mid, mtype, content_url, created_at, feeder_name, feeder_id, species_name, "Unknown Owner", postcard_id
+                            mid,
+                            mtype,
+                            content_url,
+                            created_at,
+                            feeder_name,
+                            feeder_id,
+                            species_name,
+                            "Unknown Owner",
+                            postcard_id,
                         )
                         if status == "downloaded":
                             total_downloaded += 1
@@ -836,9 +937,13 @@ class BirdBuddyDownloader:
                 f"[DRY-RUN SUMMARY] Would download: {total_would_download} item(s) | Skipped (already downloaded): {total_skipped} item(s)"
             )
         elif self.stop_requested:
-            logger.info(f"Feed sync stopped early. Media files downloaded before stop: {total_downloaded}")
+            logger.info(
+                f"Feed sync stopped early. Media files downloaded before stop: {total_downloaded}"
+            )
         else:
-            logger.info(f"Feed sync complete. Total new media files downloaded: {total_downloaded}")
+            logger.info(
+                f"Feed sync complete. Total new media files downloaded: {total_downloaded}"
+            )
         return total_downloaded
 
     async def sync_collections(self) -> int:
@@ -854,7 +959,9 @@ class BirdBuddyDownloader:
             if not collections or self.stop_requested:
                 return 0
 
-            logger.info(f"Found {len(collections)} collection(s). Syncing collection media...")
+            logger.info(
+                f"Found {len(collections)} collection(s). Syncing collection media..."
+            )
             total_would_download = 0
             total_skipped = 0
 
@@ -862,7 +969,11 @@ class BirdBuddyDownloader:
                 if self.stop_requested:
                     break
                 cid = c.get("id")
-                species = c.get("species", {}).get("name", "Unknown Species") if "species" in c else "Unknown Species"
+                species = (
+                    c.get("species", {}).get("name", "Unknown Species")
+                    if "species" in c
+                    else "Unknown Species"
+                )
 
                 cursor = None
                 while not self.stop_requested:
@@ -871,7 +982,9 @@ class BirdBuddyDownloader:
                         variables={"collectionId": cid, "first": 50, "after": cursor},
                     )
                     collection_obj = media_data.get("collection", {})
-                    media_conn = collection_obj.get("media", {}) if collection_obj else {}
+                    media_conn = (
+                        collection_obj.get("media", {}) if collection_obj else {}
+                    )
                     edges = media_conn.get("edges", [])
                     if not edges or self.stop_requested:
                         break
@@ -890,11 +1003,22 @@ class BirdBuddyDownloader:
                         feeder_id = "collection"
                         owner_name = cnode.get("ownerName", "Unknown Owner")
 
-                        if self.args.feeder_filter and self.args.feeder_filter.lower() not in feeder_name.lower():
+                        if (
+                            self.args.feeder_filter
+                            and self.args.feeder_filter.lower()
+                            not in feeder_name.lower()
+                        ):
                             continue
 
                         status = await self.process_media_item(
-                            mid, mtype, content_url, created_at, feeder_name, feeder_id, species, owner_name
+                            mid,
+                            mtype,
+                            content_url,
+                            created_at,
+                            feeder_name,
+                            feeder_id,
+                            species,
+                            owner_name,
                         )
                         if status == "downloaded":
                             total_downloaded += 1
@@ -913,7 +1037,9 @@ class BirdBuddyDownloader:
                     f"[DRY-RUN COLLECTIONS SUMMARY] Would download: {total_would_download} item(s) | Skipped: {total_skipped} item(s)"
                 )
             else:
-                logger.info(f"Collections sync complete. New media downloaded: {total_downloaded}")
+                logger.info(
+                    f"Collections sync complete. New media downloaded: {total_downloaded}"
+                )
         except Exception as e:
             if not self.stop_requested:
                 logger.debug(f"Collections sync skipped or encountered error: {e}")
@@ -928,16 +1054,14 @@ class BirdBuddyDownloader:
         feeder_events = {}
 
         cursor = self.conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT feeder_name,
                    MIN(created_at) as earliest,
                    MAX(created_at) as latest,
                    COUNT(*) as total_media
             FROM downloaded_media
             GROUP BY feeder_name
-            """
-        )
+            """)
         for row in cursor.fetchall():
             feeder_events[row[0]] = {
                 "earliest": row[1],
@@ -947,7 +1071,9 @@ class BirdBuddyDownloader:
 
         for fid, f in self.feeders_map.items():
             fname = f.get("name", "Unnamed Feeder")
-            events = feeder_events.get(fname, {"earliest": None, "latest": None, "total_media": 0})
+            events = feeder_events.get(
+                fname, {"earliest": None, "latest": None, "total_media": 0}
+            )
 
             battery = f.get("battery", {})
             food = f.get("food", {})
@@ -984,8 +1110,7 @@ class BirdBuddyDownloader:
             feeders_info.append(f_detail)
 
         species_stats = []
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT species_name,
                    SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END) as images,
                    SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) as videos,
@@ -993,8 +1118,7 @@ class BirdBuddyDownloader:
             FROM downloaded_media
             GROUP BY species_name
             ORDER BY total DESC
-            """
-        )
+            """)
         for row in cursor.fetchall():
             species_stats.append(
                 {
@@ -1006,7 +1130,9 @@ class BirdBuddyDownloader:
             )
 
         return {
-            "account_user": self.bb.user.get("email") if self.bb and self.bb.user else None,
+            "account_user": (
+                self.bb.user.get("email") if self.bb and self.bb.user else None
+            ),
             "feeders": feeders_info,
             "species_summary": species_stats,
         }
@@ -1035,7 +1161,9 @@ class BirdBuddyDownloader:
                 if retention_days > 0:
                     num_cleaned = cleanup_old_db_records(self.conn, retention_days)
                     if num_cleaned > 0:
-                        logger.info(f"Database cleanup: removed {num_cleaned} record(s) older than {retention_days} days.")
+                        logger.info(
+                            f"Database cleanup: removed {num_cleaned} record(s) older than {retention_days} days."
+                        )
 
             self.last_sync_time = datetime.now(timezone.utc)
             self.last_sync_downloaded = total_new
@@ -1471,12 +1599,18 @@ async def handle_api_status(request: web.Request) -> web.Response:
         "status": "ok",
         "is_syncing": downloader.is_syncing,
         "interval_seconds": downloader.args.interval,
-        "last_sync_time": downloader.last_sync_time.isoformat() if downloader.last_sync_time else None,
+        "last_sync_time": (
+            downloader.last_sync_time.isoformat() if downloader.last_sync_time else None
+        ),
         "last_sync_status": downloader.last_sync_status,
         "last_sync_downloaded": downloader.last_sync_downloaded,
-        "next_sync_time": downloader.next_sync_time.isoformat() if downloader.next_sync_time else None,
+        "next_sync_time": (
+            downloader.next_sync_time.isoformat() if downloader.next_sync_time else None
+        ),
         "last_error": downloader.last_error,
-        "uptime_seconds": int((datetime.now(timezone.utc) - downloader.start_time).total_seconds()),
+        "uptime_seconds": int(
+            (datetime.now(timezone.utc) - downloader.start_time).total_seconds()
+        ),
         "feeders_hardware": hardware_feeders,
         "stats": stats,
     }
@@ -1487,10 +1621,17 @@ async def handle_api_sync(request: web.Request) -> web.Response:
     """Trigger on-demand sync cycle immediately."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
     if downloader.is_syncing:
-        return web.json_response({"status": "already_syncing", "message": "A sync cycle is currently active."})
+        return web.json_response(
+            {
+                "status": "already_syncing",
+                "message": "A sync cycle is currently active.",
+            }
+        )
 
     downloader.trigger_sync()
-    return web.json_response({"status": "triggered", "message": "Sync cycle triggered successfully."})
+    return web.json_response(
+        {"status": "triggered", "message": "Sync cycle triggered successfully."}
+    )
 
 
 async def create_web_app(downloader: BirdBuddyDownloader) -> web.Application:
@@ -1510,7 +1651,9 @@ def print_info_report(info: dict, as_json: bool = False):
         return
 
     print("\n" + "=" * 80)
-    print("                        BIRD BUDDY ACCOUNT INFORMATION                         ")
+    print(
+        "                        BIRD BUDDY ACCOUNT INFORMATION                         "
+    )
     print("=" * 80)
 
     user = info.get("account_user", "N/A")
@@ -1524,16 +1667,26 @@ def print_info_report(info: dict, as_json: bool = False):
         print(f"      State: {f['state']}")
 
         bat = f.get("battery", {})
-        bat_str = f"{bat.get('percentage')}%" if bat.get("percentage") is not None else "N/A"
+        bat_str = (
+            f"{bat.get('percentage')}%" if bat.get("percentage") is not None else "N/A"
+        )
         bat_charging = "Charging" if bat.get("charging") else "Not Charging"
         bat_state = bat.get("state") or "N/A"
         print(f"      Battery: {bat_str} ({bat_state}, {bat_charging})")
 
         print(f"      Food Level: {f.get('food_state') or 'N/A'}")
         sig = f.get("signal", {})
-        sig_str = f"{sig.get('state')} ({sig.get('value_dbm')} dBm)" if sig.get("value_dbm") else "N/A"
+        sig_str = (
+            f"{sig.get('state')} ({sig.get('value_dbm')} dBm)"
+            if sig.get("value_dbm")
+            else "N/A"
+        )
         print(f"      Wi-Fi Signal: {sig_str}")
-        print(f"      Temperature: {f.get('temperature')}°C" if f.get("temperature") is not None else "      Temperature: N/A")
+        print(
+            f"      Temperature: {f.get('temperature')}°C"
+            if f.get("temperature") is not None
+            else "      Temperature: N/A"
+        )
 
         earliest = f.get("earliest_event") or "N/A"
         latest = f.get("latest_event") or "N/A"
@@ -1610,22 +1763,45 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, web dashboard, and feeder info."
     )
-    parser.add_argument("--env-file", default=known_args.env_file, help="Path to .env file containing credentials (default: .env)")
-    parser.add_argument("--username", default=os.getenv("USERNAME"), help="Bird Buddy account email (overrides USERNAME env var)")
-    parser.add_argument("--password", default=os.getenv("PASSWORD"), help="Bird Buddy account password (overrides PASSWORD env var)")
-    parser.add_argument("--download-dir", default=os.getenv("DOWNLOAD_DIR", "./downloads"), help="Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)")
-    parser.add_argument("--db-path", default=os.getenv("DB_PATH", "./data/birdbuddy_downloader.db"), help="SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)")
+    parser.add_argument(
+        "--env-file",
+        default=known_args.env_file,
+        help="Path to .env file containing credentials (default: .env)",
+    )
+    parser.add_argument(
+        "--username",
+        default=os.getenv("USERNAME"),
+        help="Bird Buddy account email (overrides USERNAME env var)",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.getenv("PASSWORD"),
+        help="Bird Buddy account password (overrides PASSWORD env var)",
+    )
+    parser.add_argument(
+        "--download-dir",
+        default=os.getenv("DOWNLOAD_DIR", "./downloads"),
+        help="Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=os.getenv("DB_PATH", "./data/birdbuddy_downloader.db"),
+        help="SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)",
+    )
     parser.add_argument(
         "--dir-template",
         default=os.getenv("DIR_TEMPLATE", "{feeder_name}/{species_name}"),
         help="Template for output subdirectories relative to download-dir (default: '{feeder_name}/{species_name}'). "
-             "Variables: feeder_name, species_name, owner_name, detection_id, postcard_id, sighting_id, year, month, day, hour, minute, second, date, iso_date, time, etc.",
+        "Variables: feeder_name, species_name, owner_name, detection_id, postcard_id, sighting_id, year, month, day, hour, minute, second, date, iso_date, time, etc.",
     )
     parser.add_argument(
         "--filename-template",
-        default=os.getenv("FILENAME_TEMPLATE", "{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}"),
+        default=os.getenv(
+            "FILENAME_TEMPLATE",
+            "{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}",
+        ),
         help="Template for output filenames (default: '{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}'). "
-             "Variables: year, month, day, hour, minute, second, date, time, media_id_short, detection_id_short, postcard_id_short, feeder_name, species_name, ext, etc.",
+        "Variables: year, month, day, hour, minute, second, date, time, media_id_short, detection_id_short, postcard_id_short, feeder_name, species_name, ext, etc.",
     )
     parser.add_argument(
         "--buffer-hours",
@@ -1645,18 +1821,77 @@ def parse_args():
         default=str_to_bool(os.getenv("FULL_SYNC", "false")),
         help="Bypass latest detection cutoff and perform a full feed sync",
     )
-    parser.add_argument("--interval", type=int, default=str_to_int(os.getenv("INTERVAL"), 0), help="Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)")
-    parser.add_argument("--max-pages", type=int, default=str_to_int(os.getenv("MAX_PAGES"), 0), help="Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)")
-    parser.add_argument("--no-images", action="store_true", default=str_to_bool(os.getenv("NO_IMAGES", "false")), help="Skip downloading image files")
-    parser.add_argument("--no-videos", action="store_true", default=str_to_bool(os.getenv("NO_VIDEOS", "false")), help="Skip downloading video files")
-    parser.add_argument("--feeder-filter", default=os.getenv("FEEDER_FILTER"), help="Filter downloads by feeder name (case-insensitive substring)")
-    parser.add_argument("--dry-run", action="store_true", default=str_to_bool(os.getenv("DRY_RUN", "false")), help="Perform a dry run without downloading files or modifying database")
-    parser.add_argument("--info", action="store_true", default=str_to_bool(os.getenv("INFO", "false")), help="Display feeder information, battery status, species media counts, and event date ranges")
-    parser.add_argument("--json", action="store_true", default=str_to_bool(os.getenv("JSON", "false")), help="Output --info as raw JSON")
-    parser.add_argument("--web-port", type=int, default=str_to_int(os.getenv("WEB_PORT"), 8080), help="Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)")
-    parser.add_argument("--web-host", default=os.getenv("WEB_HOST", "0.0.0.0"), help="Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)")
-    parser.add_argument("--no-web", action="store_true", default=str_to_bool(os.getenv("NO_WEB", "false")), help="Disable embedded web status dashboard")
-    parser.add_argument("-v", "--verbose", action="store_true", default=str_to_bool(os.getenv("VERBOSE", "false")), help="Enable debug logging")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=str_to_int(os.getenv("INTERVAL"), 0),
+        help="Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=str_to_int(os.getenv("MAX_PAGES"), 0),
+        help="Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)",
+    )
+    parser.add_argument(
+        "--no-images",
+        action="store_true",
+        default=str_to_bool(os.getenv("NO_IMAGES", "false")),
+        help="Skip downloading image files",
+    )
+    parser.add_argument(
+        "--no-videos",
+        action="store_true",
+        default=str_to_bool(os.getenv("NO_VIDEOS", "false")),
+        help="Skip downloading video files",
+    )
+    parser.add_argument(
+        "--feeder-filter",
+        default=os.getenv("FEEDER_FILTER"),
+        help="Filter downloads by feeder name (case-insensitive substring)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=str_to_bool(os.getenv("DRY_RUN", "false")),
+        help="Perform a dry run without downloading files or modifying database",
+    )
+    parser.add_argument(
+        "--info",
+        action="store_true",
+        default=str_to_bool(os.getenv("INFO", "false")),
+        help="Display feeder information, battery status, species media counts, and event date ranges",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=str_to_bool(os.getenv("JSON", "false")),
+        help="Output --info as raw JSON",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=str_to_int(os.getenv("WEB_PORT"), 8080),
+        help="Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)",
+    )
+    parser.add_argument(
+        "--web-host",
+        default=os.getenv("WEB_HOST", "0.0.0.0"),
+        help="Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)",
+    )
+    parser.add_argument(
+        "--no-web",
+        action="store_true",
+        default=str_to_bool(os.getenv("NO_WEB", "false")),
+        help="Disable embedded web status dashboard",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=str_to_bool(os.getenv("VERBOSE", "false")),
+        help="Enable debug logging",
+    )
     return parser.parse_args()
 
 
@@ -1678,7 +1913,9 @@ async def main():
     main_task = asyncio.current_task()
 
     def signal_handler(signum, frame):
-        logger.info("\n[!] Ctrl-C / Stop signal received! Stopping downloader immediately...")
+        logger.info(
+            "\n[!] Ctrl-C / Stop signal received! Stopping downloader immediately..."
+        )
         downloader.request_stop()
         if main_task and not main_task.done():
             main_task.cancel()
@@ -1695,31 +1932,43 @@ async def main():
             await runner.setup()
             site = web.TCPSite(runner, host=args.web_host, port=args.web_port)
             await site.start()
-            logger.info(f"Web status dashboard running at http://{args.web_host}:{args.web_port}/")
+            logger.info(
+                f"Web status dashboard running at http://{args.web_host}:{args.web_port}/"
+            )
         except Exception as e:
-            logger.warning(f"Could not start web dashboard server on {args.web_host}:{args.web_port}: {e}")
+            logger.warning(
+                f"Could not start web dashboard server on {args.web_host}:{args.web_port}: {e}"
+            )
 
     try:
         mode_label = " (Dry-Run mode)" if args.dry_run else ""
         if args.interval <= 0:
-            logger.info(f"Starting Bird Buddy Downloader (Single Run mode){mode_label}...")
+            logger.info(
+                f"Starting Bird Buddy Downloader (Single Run mode){mode_label}..."
+            )
             await downloader.run_once()
             if not downloader.stop_requested:
                 logger.info(f"Done{mode_label}!")
             # If web dashboard is active, keep running until stopped
             if not args.no_web and not downloader.stop_requested:
-                logger.info("Web dashboard active. Keeping process alive (Press Ctrl-C to exit)...")
+                logger.info(
+                    "Web dashboard active. Keeping process alive (Press Ctrl-C to exit)..."
+                )
                 while not downloader.stop_requested:
                     try:
                         downloader.sync_trigger_event.clear()
-                        await asyncio.wait_for(downloader.sync_trigger_event.wait(), timeout=1.0)
+                        await asyncio.wait_for(
+                            downloader.sync_trigger_event.wait(), timeout=1.0
+                        )
                         if not downloader.stop_requested:
                             logger.info("Manual sync triggered via web interface...")
                             await downloader.run_once()
                     except asyncio.TimeoutError:
                         pass
         else:
-            logger.info(f"Starting Bird Buddy Downloader in Continuous Daemon mode (Interval: {args.interval}s){mode_label}...")
+            logger.info(
+                f"Starting Bird Buddy Downloader in Continuous Daemon mode (Interval: {args.interval}s){mode_label}..."
+            )
             while not downloader.stop_requested:
                 try:
                     await downloader.run_once()
@@ -1732,15 +1981,25 @@ async def main():
                 if downloader.stop_requested:
                     break
 
-                downloader.next_sync_time = datetime.now(timezone.utc) + timedelta(seconds=args.interval)
+                downloader.next_sync_time = datetime.now(timezone.utc) + timedelta(
+                    seconds=args.interval
+                )
                 downloader.sync_trigger_event.clear()
-                logger.info(f"Sleeping for {args.interval} seconds until next check (Next sync at {downloader.next_sync_time.strftime('%H:%M:%S')} UTC)...")
+                logger.info(
+                    f"Sleeping for {args.interval} seconds until next check (Next sync at {downloader.next_sync_time.strftime('%H:%M:%S')} UTC)..."
+                )
 
                 sleep_remaining = args.interval
                 while sleep_remaining > 0 and not downloader.stop_requested:
                     try:
-                        await asyncio.wait_for(downloader.sync_trigger_event.wait(), timeout=min(1.0, sleep_remaining))
-                        if downloader.sync_trigger_event.is_set() and not downloader.stop_requested:
+                        await asyncio.wait_for(
+                            downloader.sync_trigger_event.wait(),
+                            timeout=min(1.0, sleep_remaining),
+                        )
+                        if (
+                            downloader.sync_trigger_event.is_set()
+                            and not downloader.stop_requested
+                        ):
                             logger.info("Immediate sync requested via web interface!")
                             downloader.sync_trigger_event.clear()
                             break
