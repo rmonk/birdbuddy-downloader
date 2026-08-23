@@ -14,6 +14,9 @@ This document provides architectural context, development guidelines, CLI flags,
 - **Custom Templating**: Dynamic subdirectory (`--dir-template`) and filename (`--filename-template`) generation with support for detection/postcard event grouping (`{detection_id}`, `{postcard_id}`, `{sighting_id}`).
 - **Incremental Syncing**: Uses the latest DB capture timestamp minus a 2-hour buffer (`--buffer-hours 2.0`) as the cutoff point to halt feed pagination early for maximum efficiency.
 - **Automated Database Cleanup**: Automatically purges database records older than 14 days (`--db-retention-days 14`) after each run.
+- **Web Status Dashboard**: Embedded web interface (`--web-port 8080`) displaying sync interval, last sync timestamp/status, next sync countdown, and per-feeder download breakdown across the past hour, day (24h), and week (7d).
+- **Persistent Auth & Session Resilience**: Retains OAuth tokens across intervals, refreshing access tokens without triggering repeated full password logins.
+- **Robust Sockets & Timeouts**: Granular connection (`15s`) and socket read (`30s`) timeouts prevent network stalls from hanging the daemon.
 - **Account & Hardware Reporting**: Detailed camera information (`--info`), including battery level, food level, Wi-Fi signal, date ranges, and species counts.
 - **Dry-Run Mode**: Non-destructive preview (`--dry-run`) of files to be downloaded versus skipped.
 - **Graceful Termination**: Handles `SIGINT` (Ctrl-C) and `SIGTERM` instantly, cancelling network streams and cleaning up temporary `.tmp` download files.
@@ -24,9 +27,15 @@ This document provides architectural context, development guidelines, CLI flags,
 
 ```text
 birdbuddy-downloader/
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml # GitHub Actions CI/CD to build & push container
 ├── AGENTS.md                  # Context & guidelines for AI agents
 ├── LICENSE                    # MIT License file
 ├── README.md                  # End-user documentation
+├── Containerfile              # Container build definition (exposes 8080)
+├── docker-compose.yml         # Docker Compose configuration
+├── podman-compose.yml         # Podman Compose configuration
 ├── downloader.py              # Main Python application entry point
 ├── requirements.txt           # Python dependency requirements
 ├── .env                       # Local credentials (USERNAME, PASSWORD) - DO NOT COMMIT
@@ -52,7 +61,7 @@ birdbuddy-downloader/
 - `pybirdbuddy`: Unofficial GraphQL client for Bird Buddy.
 - `python-dotenv`: Environment variable loading from `.env`.
 - `piexif` & `pillow`: EXIF manipulation and image handling.
-- `requests` & `aiohttp`: HTTP requests and async downloading.
+- `requests` & `aiohttp`: HTTP requests, async downloading, and embedded web status server.
 
 ---
 
@@ -70,15 +79,20 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     downloaded_at TEXT,
     file_path TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
+CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
+CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
 ```
 
 ### Key Functions & Classes
-- `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, and media downloading.
+- `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, state tracking, and media downloading.
+- `get_feeder_download_stats()`: Queries SQLite for per-feeder download breakdown (past hour, 24 hours, 7 days, all-time totals, and recent activity).
+- `create_web_app()`: Sets up the asynchronous `aiohttp.web` dashboard serving HTML and `/api/status` & `/api/sync` endpoints.
 - `get_latest_download_timestamp()`: Finds the max `created_at` timestamp in SQLite to calculate the incremental sync cutoff.
 - `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days) from SQLite after each run.
 - `build_template_vars()`: Generates a dictionary of metadata placeholders (`feeder_name`, `species_name`, `detection_id`, `postcard_id`, `sighting_id`, `year`, `month`, `day`, `media_id_short`, etc.).
 - `render_dest_path()`: Safely formats directory and filename strings using `SafeDict` to prevent `KeyError` crashes, sanitizes path components, and ensures correct extensions (`.jpg`/`.mp4`).
-- `download_file()`: Downloads files atomically to `.tmp` files first, replacing the destination file upon completion. Checks `stop_checker` mid-stream for cancellation.
+- `download_file()`: Downloads files atomically to `.tmp` files first with explicit socket timeouts, replacing destination upon completion.
 - `apply_timestamps_and_exif()`: Writes EXIF `DateTimeOriginal`, `DateTimeDigitized`, `DateTime` and updates file system modification time (`os.utime`).
 
 ---
@@ -105,6 +119,9 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
 | `--dry-run` | `False` | Preview downloads without writing files or mutating DB |
 | `--info` | `False` | Print feeder status, battery level, species count report |
 | `--json` | `False` | Output `--info` as raw JSON |
+| `--web-port` | `8080` | Port for embedded web status dashboard (or `WEB_PORT` env var) |
+| `--web-host` | `0.0.0.0` | Host to bind embedded web dashboard (or `WEB_HOST` env var) |
+| `--no-web` | `False` | Disable embedded web status dashboard |
 | `-v`, `--verbose` | `False` | Enable debug logging |
 
 ---

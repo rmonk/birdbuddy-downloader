@@ -12,6 +12,9 @@ services:
     environment:
       - DOWNLOAD_DIR=/app/downloads
       - DB_PATH=/app/data/birdbuddy_downloader.db
+      - WEB_PORT=8080
+    ports:
+      - "8080:8080"
     volumes:
       - ./downloads:/app/downloads:z
       - ./data:/app/data:z

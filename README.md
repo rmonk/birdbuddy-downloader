@@ -31,6 +31,15 @@ An automated python utility to download images and videos from all Bird Buddy ca
 - **Flexible Execution**:
   - **Single-run mode**: Ideal for running via `cron` or `systemd` timers.
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
+- **Web Status Dashboard**:
+  - Embedded real-time web dashboard running on port `8080` (configurable via `--web-port` / `WEB_PORT`).
+  - Displays sync interval, last sync execution time/status, next scheduled sync countdown, and connected feeder hardware status.
+  - Shows breakdown table of photos and videos downloaded over the **past hour**, **past day (24 hours)**, and **past week (7 days)** per camera feeder and overall totals.
+  - Provides a "Sync Now" button to trigger immediate on-demand syncing.
+- **Session Resilience & Anti-Throttling**:
+  - Automatically preserves and refreshes OAuth tokens across runs, preventing excessive password authentication that causes account/IP throttling.
+- **Robust Sockets & Timeouts**:
+  - Granular connection (`15s`) and socket read (`30s`) timeouts prevent network stalls from hanging the daemon.
 - **Media Filtering**: Option to skip videos (`--no-videos`), skip images (`--no-images`), or filter by specific feeder name (`--feeder-filter`).
 
 ---
@@ -104,7 +113,15 @@ podman run --rm --env-file .env \
   birdbuddy-downloader --dry-run
 ```
 
-## Output Path & Filename Templating
+### 4. Automated Container Builds (GitHub Actions)
+
+A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and push them to `docker.io/moosemouse/birdbuddy-downloader:latest` on every push to `main` or new version tag.
+
+**Required GitHub Repository Secrets**:
+- `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).
+- `DOCKERHUB_TOKEN`: Docker Hub Personal Access Token (PAT) with Read/Write permissions.
+
+---
 
 You can define custom directory structures and filenames using `--dir-template` and `--filename-template` flags (or `DIR_TEMPLATE` and `FILENAME_TEMPLATE` in `.env`).
 
@@ -223,6 +240,9 @@ options:
   --dry-run             Perform a dry run without downloading files or modifying database
   --info                Display feeder information, battery status, species media counts, and event date ranges
   --json                Output --info as raw JSON
+  --web-port WEB_PORT   Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)
+  --web-host WEB_HOST   Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)
+  --no-web              Disable embedded web status dashboard
   -v, --verbose         Enable debug logging
 ```
 

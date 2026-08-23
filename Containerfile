@@ -21,5 +21,8 @@ COPY downloader.py .
 # Expose default download and database volumes
 VOLUME ["/app/downloads", "/app/data"]
 
+# Expose web dashboard port
+EXPOSE 8080
+
 # Default entrypoint runs downloader script
 ENTRYPOINT ["python", "downloader.py"]
