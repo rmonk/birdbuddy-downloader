@@ -66,7 +66,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("birdbuddy-downloader")
 
-DB_SCHEMA = """
+DB_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloaded_media (
     media_id TEXT PRIMARY KEY,
     feeder_id TEXT,
@@ -82,11 +82,6 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     trash_path TEXT,
     deleted_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
-CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
-CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
-CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id);
-CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 """
 
 
@@ -99,9 +94,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     with conn:
-        conn.executescript(DB_SCHEMA)
+        conn.execute(DB_TABLE_SCHEMA)
 
-        # Migrate existing tables if columns are missing
+        # Migrate existing tables if columns are missing BEFORE creating indexes on those columns
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(downloaded_media)")
         existing_cols = {row[1] for row in cursor.fetchall()}
@@ -121,11 +116,20 @@ def init_db(db_path: str) -> sqlite3.Connection:
         if "deleted_at" not in existing_cols:
             cursor.execute("ALTER TABLE downloaded_media ADD COLUMN deleted_at TEXT")
 
-        # Ensure indexes exist
-        cursor.execute(
+        # Create indexes after ensuring all columns exist
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at)"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id)"
         )
-        cursor.execute(
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted)"
         )
 
