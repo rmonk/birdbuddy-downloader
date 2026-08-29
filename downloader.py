@@ -224,7 +224,9 @@ def soft_delete_media(
             shutil.move(file_path, target_trash_path)
         except Exception as e:
             logger.error(f"Failed to move {file_path} to {target_trash_path}: {e}")
-            target_trash_path = file_path
+            return False
+    else:
+        target_trash_path = None
 
     now_iso = datetime.now(timezone.utc).isoformat()
     with conn:
@@ -258,6 +260,7 @@ def restore_media(conn: sqlite3.Connection, media_id: str) -> bool:
             shutil.move(trash_path, file_path)
         except Exception as e:
             logger.error(f"Failed to restore {trash_path} to {file_path}: {e}")
+            return False
 
     with conn:
         conn.execute(
@@ -905,7 +908,7 @@ class BirdBuddyDownloader:
                 and not self.args.dry_run
             ):
                 sharpness = (
-                    calculate_image_sharpness(dest_path)
+                    await asyncio.to_thread(calculate_image_sharpness, dest_path)
                     if media_type == "image"
                     else None
                 )
@@ -944,7 +947,9 @@ class BirdBuddyDownloader:
                     dest_path, dt, is_image=(media_type == "image")
                 )
             sharpness = (
-                calculate_image_sharpness(dest_path) if media_type == "image" else None
+                await asyncio.to_thread(calculate_image_sharpness, dest_path)
+                if media_type == "image"
+                else None
             )
             record_media_downloaded(
                 self.conn,
@@ -1865,7 +1870,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           if (isSharpest) tileClass += " sharpest-tile";
 
           html += `<div class="${tileClass}" id="tile-${m.media_id}">
-            <div class="thumb-wrapper" onclick="openModal('${m.media_id}', '${m.media_type}', '${escapeHtml(s.species_name)}', '${escapeHtml(s.feeder_name)}', '${sharpScore || ''}', ${isSharpest})">
+            <div class="thumb-wrapper" onclick="openModal('${escapeJsAttr(m.media_id)}', '${escapeJsAttr(m.media_type)}', '${escapeJsAttr(s.species_name)}', '${escapeJsAttr(s.feeder_name)}', '${escapeJsAttr(sharpScore || '')}', ${isSharpest})">
               ${isVid ? `<video class="thumb-img" src="${viewUrl}" preload="metadata"></video><span class="video-badge-icon">▶</span>` : `<img class="thumb-img" src="${thumbUrl}" alt="bird photo" loading="lazy">`}
               <div class="tile-overlay-top">
                 <span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${m.media_type.toUpperCase()}</span>
@@ -1880,8 +1885,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               </div>
               <div class="tile-actions">
                 ${isDeleted ?
-                  `<button class="btn btn-restore" onclick="restoreMedia('${m.media_id}')">↩️ Restore</button>` :
-                  `<button class="btn btn-danger" onclick="deleteMedia('${m.media_id}')">🗑️ Delete</button>`
+                  `<button class="btn btn-restore" onclick="restoreMedia('${escapeJsAttr(m.media_id)}')">↩️ Restore</button>` :
+                  `<button class="btn btn-danger" onclick="deleteMedia('${escapeJsAttr(m.media_id)}')">🗑️ Delete</button>`
                 }
               </div>
             </div>
@@ -1896,6 +1901,16 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       container.innerHTML = html;
     }
 
+    async function loadAllSightings() {
+      try {
+        const resp = await fetch("/api/sightings?limit=0&days=7");
+        const data = await resp.json();
+        renderSightings(data.sightings || []);
+      } catch (e) {
+        console.error("Error fetching all sightings:", e);
+      }
+    }
+
     async function toggleAllSightings() {
       showingAllSightings = !showingAllSightings;
       const btn = document.getElementById("toggleSightingsBtn");
@@ -1904,13 +1919,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (showingAllSightings) {
         btn.innerText = "Show Recent 5 Sets";
         badge.innerText = "All (7 Days)";
-        try {
-          const resp = await fetch("/api/sightings?limit=0&days=7");
-          const data = await resp.json();
-          renderSightings(data.sightings || []);
-        } catch (e) {
-          console.error("Error fetching all sightings:", e);
-        }
+        await loadAllSightings();
       } else {
         btn.innerText = "Show All Past 7 Days";
         badge.innerText = "5 Sets";
@@ -1927,8 +1936,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         });
         if (resp.ok) {
           if (showingAllSightings) {
-            toggleAllSightings();
-            toggleAllSightings();
+            await loadAllSightings();
           } else {
             loadStatus();
           }
@@ -1947,8 +1955,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         });
         if (resp.ok) {
           if (showingAllSightings) {
-            toggleAllSightings();
-            toggleAllSightings();
+            await loadAllSightings();
           } else {
             loadStatus();
           }
@@ -1961,17 +1968,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function openModal(mediaId, mediaType, species, feeder, sharpness, isSharpest) {
       const container = document.getElementById("modalMediaContainer");
       const caption = document.getElementById("modalCaption");
-      const viewUrl = `/api/media/${mediaId}/view`;
+      const viewUrl = `/api/media/${encodeURIComponent(mediaId)}/view`;
 
       if (mediaType === "video") {
         container.innerHTML = `<video class="modal-media" src="${viewUrl}" controls autoplay></video>`;
       } else {
-        container.innerHTML = `<img class="modal-media" src="${viewUrl}" alt="${species}">`;
+        container.innerHTML = `<img class="modal-media" src="${viewUrl}" alt="${escapeHtml(species)}">`;
       }
 
-      let sharpText = sharpness ? ` | Sharpness Variance: <strong>${sharpness}</strong>` : '';
+      let sharpText = sharpness ? ` | Sharpness Variance: <strong>${escapeHtml(sharpness)}</strong>` : '';
       if (isSharpest) sharpText += ' <span style="color:var(--gold); font-weight:bold;">(⭐ Sharpest of Sighting)</span>';
-      caption.innerHTML = `<strong>${species}</strong> - ${feeder}${sharpText}`;
+      caption.innerHTML = `<strong>${escapeHtml(species)}</strong> - ${escapeHtml(feeder)}${sharpText}`;
 
       document.getElementById("mediaModal").classList.add("active");
     }
@@ -1997,8 +2004,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     function escapeHtml(str) {
-      if (!str) return "";
-      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      if (str == null) return "";
+      return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function escapeJsAttr(str) {
+      if (str == null) return "";
+      return escapeHtml(String(str)).replace(/\\/g, "\\\\");
     }
 
     function setupAutoRefresh() {
@@ -2078,11 +2090,32 @@ async def handle_api_status(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+def check_api_auth(request: web.Request, downloader: BirdBuddyDownloader) -> bool:
+    """Validate optional API key for mutating endpoints if configured."""
+    configured_key = getattr(downloader.args, "web_api_key", None) or os.getenv(
+        "WEB_API_KEY"
+    )
+    if not configured_key:
+        return True
+    header_key = request.headers.get("X-API-Key")
+    auth_header = request.headers.get("Authorization", "")
+    bearer_key = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+    query_key = request.query.get("api_key")
+    provided = header_key or bearer_key or query_key
+    return provided == configured_key
+
+
 async def handle_api_sightings(request: web.Request) -> web.Response:
     """Return all recent sightings grouped by sighting_id."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
-    days = int(request.query.get("days", "7"))
-    limit = int(request.query.get("limit", "0"))
+    try:
+        days = max(1, int(request.query.get("days", "7")))
+        limit = max(0, int(request.query.get("limit", "0")))
+    except ValueError:
+        return web.json_response(
+            {"status": "error", "message": "days and limit must be integers"},
+            status=400,
+        )
     sightings = get_recent_sightings(downloader.conn, days=days, limit=limit)
     return web.json_response({"status": "ok", "sightings": sightings})
 
@@ -2169,6 +2202,10 @@ async def handle_media_thumb(request: web.Request) -> web.Response:
 async def handle_media_delete(request: web.Request) -> web.Response:
     """Soft delete media item and move to .trash/."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
+    if not check_api_auth(request, downloader):
+        return web.json_response(
+            {"status": "error", "message": "Unauthorized"}, status=401
+        )
     try:
         data = await request.json()
         media_id = data.get("media_id")
@@ -2193,6 +2230,10 @@ async def handle_media_delete(request: web.Request) -> web.Response:
 async def handle_media_restore(request: web.Request) -> web.Response:
     """Restore soft-deleted media item from .trash/."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
+    if not check_api_auth(request, downloader):
+        return web.json_response(
+            {"status": "error", "message": "Unauthorized"}, status=401
+        )
     try:
         data = await request.json()
         media_id = data.get("media_id")
@@ -2217,6 +2258,10 @@ async def handle_media_restore(request: web.Request) -> web.Response:
 async def handle_api_sync(request: web.Request) -> web.Response:
     """Trigger on-demand sync cycle immediately."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
+    if not check_api_auth(request, downloader):
+        return web.json_response(
+            {"status": "error", "message": "Unauthorized"}, status=401
+        )
     if downloader.is_syncing:
         return web.json_response(
             {
@@ -2481,6 +2526,11 @@ def parse_args():
         "--web-host",
         default=os.getenv("WEB_HOST", "0.0.0.0"),
         help="Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)",
+    )
+    parser.add_argument(
+        "--web-api-key",
+        default=os.getenv("WEB_API_KEY"),
+        help="Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)",
     )
     parser.add_argument(
         "--no-web",
