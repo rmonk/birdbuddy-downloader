@@ -254,13 +254,18 @@ def restore_media(conn: sqlite3.Connection, media_id: str) -> bool:
     if not is_deleted:
         return True
 
-    if trash_path and os.path.exists(trash_path) and file_path:
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            shutil.move(trash_path, file_path)
-        except Exception as e:
-            logger.error(f"Failed to restore {trash_path} to {file_path}: {e}")
-            return False
+    if not trash_path or not os.path.exists(trash_path) or not file_path:
+        logger.warning(
+            f"Cannot restore media {media_id}: trash file does not exist on disk ({trash_path})"
+        )
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        shutil.move(trash_path, file_path)
+    except Exception as e:
+        logger.error(f"Failed to restore {trash_path} to {file_path}: {e}")
+        return False
 
     with conn:
         conn.execute(
@@ -1824,7 +1829,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
 
         // 7. Render Sighting Event Groups
-        renderSightings(data.sightings || []);
+        if (showingAllSightings) {
+          await loadAllSightings();
+        } else {
+          renderSightings(data.sightings || []);
+        }
 
       } catch (err) {
         console.error("Dashboard error:", err);
@@ -1862,15 +1871,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const isDeleted = m.is_deleted;
           const isSharpest = m.is_sharpest && !isDeleted;
           const sharpScore = m.sharpness_score != null ? m.sharpness_score.toFixed(1) : null;
-          const viewUrl = `/api/media/${m.media_id}/view`;
-          const thumbUrl = `/api/media/${m.media_id}/thumb`;
+          const viewUrl = `/api/media/${encodeURIComponent(m.media_id)}/view`;
+          const thumbUrl = `/api/media/${encodeURIComponent(m.media_id)}/thumb`;
 
           let tileClass = "media-tile";
           if (isDeleted) tileClass += " deleted";
           if (isSharpest) tileClass += " sharpest-tile";
 
-          html += `<div class="${tileClass}" id="tile-${m.media_id}">
-            <div class="thumb-wrapper" onclick="openModal('${escapeJsAttr(m.media_id)}', '${escapeJsAttr(m.media_type)}', '${escapeJsAttr(s.species_name)}', '${escapeJsAttr(s.feeder_name)}', '${escapeJsAttr(sharpScore || '')}', ${isSharpest})">
+          html += `<div class="${tileClass}" id="tile-${escapeHtml(m.media_id)}">
+            <div class="thumb-wrapper" data-media-id="${escapeHtml(m.media_id)}" data-media-type="${escapeHtml(m.media_type)}" data-species="${escapeHtml(s.species_name)}" data-feeder="${escapeHtml(s.feeder_name)}" data-sharpness="${escapeHtml(sharpScore || '')}" data-sharpest="${isSharpest ? 'true' : 'false'}">
               ${isVid ? `<video class="thumb-img" src="${viewUrl}" preload="metadata"></video><span class="video-badge-icon">▶</span>` : `<img class="thumb-img" src="${thumbUrl}" alt="bird photo" loading="lazy">`}
               <div class="tile-overlay-top">
                 <span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${m.media_type.toUpperCase()}</span>
@@ -1880,13 +1889,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
             <div class="tile-footer">
               <div class="tile-details">
-                <span>${sharpScore ? 'Sharpness: <strong>' + sharpScore + '</strong>' : (isVid ? 'Video Clip' : '')}</span>
+                <span>${sharpScore ? 'Sharpness: <strong>' + escapeHtml(sharpScore) + '</strong>' : (isVid ? 'Video Clip' : '')}</span>
                 <span>${formatRelative(m.created_at)}</span>
               </div>
               <div class="tile-actions">
                 ${isDeleted ?
-                  `<button class="btn btn-restore" onclick="restoreMedia('${escapeJsAttr(m.media_id)}')">↩️ Restore</button>` :
-                  `<button class="btn btn-danger" onclick="deleteMedia('${escapeJsAttr(m.media_id)}')">🗑️ Delete</button>`
+                  `<button class="btn btn-restore btn-restore-action" data-media-id="${escapeHtml(m.media_id)}">↩️ Restore</button>` :
+                  `<button class="btn btn-danger btn-delete-action" data-media-id="${escapeHtml(m.media_id)}">🗑️ Delete</button>`
                 }
               </div>
             </div>
@@ -1899,6 +1908,56 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       });
 
       container.innerHTML = html;
+
+      // Attach safe event listeners without inline JS evaluation
+      container.querySelectorAll('.thumb-wrapper').forEach(el => {
+        el.addEventListener('click', () => {
+          openModal(
+            el.dataset.mediaId,
+            el.dataset.mediaType,
+            el.dataset.species,
+            el.dataset.feeder,
+            el.dataset.sharpness,
+            el.dataset.sharpest === 'true'
+          );
+        });
+      });
+
+      container.querySelectorAll('.btn-delete-action').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteMedia(btn.dataset.mediaId);
+        });
+      });
+
+      container.querySelectorAll('.btn-restore-action').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          restoreMedia(btn.dataset.mediaId);
+        });
+      });
+    }
+
+    let userApiKey = sessionStorage.getItem("bb_downloader_api_key") || "";
+
+    function getAuthHeaders() {
+      const headers = { "Content-Type": "application/json" };
+      if (userApiKey) {
+        headers["X-API-Key"] = userApiKey;
+      }
+      return headers;
+    }
+
+    async function promptApiKeyIfNeeded(resp) {
+      if (resp.status === 401) {
+        const key = prompt("API Key required for this action:");
+        if (key) {
+          userApiKey = key.trim();
+          sessionStorage.setItem("bb_downloader_api_key", userApiKey);
+          return true;
+        }
+      }
+      return false;
     }
 
     async function loadAllSightings() {
@@ -1923,23 +1982,33 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       } else {
         btn.innerText = "Show All Past 7 Days";
         badge.innerText = "5 Sets";
-        loadStatus();
+        await loadStatus();
       }
     }
 
     async function deleteMedia(mediaId) {
       try {
-        const resp = await fetch("/api/media/delete", {
+        let resp = await fetch("/api/media/delete", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: getAuthHeaders(),
           body: JSON.stringify({ media_id: mediaId })
         });
+        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
+          resp = await fetch("/api/media/delete", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ media_id: mediaId })
+          });
+        }
         if (resp.ok) {
           if (showingAllSightings) {
             await loadAllSightings();
           } else {
-            loadStatus();
+            await loadStatus();
           }
+        } else {
+          const err = await resp.json();
+          alert("Error deleting media: " + (err.message || resp.statusText));
         }
       } catch (e) {
         alert("Failed to delete media: " + e.message);
@@ -1948,17 +2017,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     async function restoreMedia(mediaId) {
       try {
-        const resp = await fetch("/api/media/restore", {
+        let resp = await fetch("/api/media/restore", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: getAuthHeaders(),
           body: JSON.stringify({ media_id: mediaId })
         });
+        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
+          resp = await fetch("/api/media/restore", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ media_id: mediaId })
+          });
+        }
         if (resp.ok) {
           if (showingAllSightings) {
             await loadAllSightings();
           } else {
-            loadStatus();
+            await loadStatus();
           }
+        } else {
+          const err = await resp.json();
+          alert("Error restoring media: " + (err.message || resp.statusText));
         }
       } catch (e) {
         alert("Failed to restore media: " + e.message);
@@ -1973,7 +2052,12 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (mediaType === "video") {
         container.innerHTML = `<video class="modal-media" src="${viewUrl}" controls autoplay></video>`;
       } else {
-        container.innerHTML = `<img class="modal-media" src="${viewUrl}" alt="${escapeHtml(species)}">`;
+        const img = document.createElement("img");
+        img.className = "modal-media";
+        img.src = viewUrl;
+        img.alt = species || "bird";
+        container.innerHTML = "";
+        container.appendChild(img);
       }
 
       let sharpText = sharpness ? ` | Sharpness Variance: <strong>${escapeHtml(sharpness)}</strong>` : '';
@@ -1993,9 +2077,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerText = "Triggering sync...";
       try {
-        const resp = await fetch("/api/sync", { method: "POST" });
-        const result = await resp.json();
-        setTimeout(loadStatus, 500);
+        let resp = await fetch("/api/sync", { method: "POST", headers: getAuthHeaders() });
+        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
+          resp = await fetch("/api/sync", { method: "POST", headers: getAuthHeaders() });
+        }
+        if (resp.ok) {
+          setTimeout(loadStatus, 500);
+        } else {
+          const err = await resp.json();
+          alert("Sync error: " + (err.message || resp.statusText));
+          btn.disabled = false;
+          btn.innerHTML = "<span>⚡ Sync Now</span>";
+        }
       } catch (e) {
         alert("Error triggering sync: " + e.message);
         btn.disabled = false;
@@ -2006,11 +2099,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     function escapeHtml(str) {
       if (str == null) return "";
       return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-    }
-
-    function escapeJsAttr(str) {
-      if (str == null) return "";
-      return escapeHtml(String(str)).replace(/\\/g, "\\\\");
     }
 
     function setupAutoRefresh() {
