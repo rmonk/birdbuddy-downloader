@@ -770,6 +770,7 @@ class BirdBuddyDownloader:
         self.last_sync_time: datetime | None = None
         self.last_sync_status = "Not run yet"
         self.last_sync_downloaded = 0
+        self.last_sync_downloaded_count = 0
         self.is_syncing = False
         self.next_sync_time: datetime | None = None
         self.last_error: str | None = None
@@ -1450,6 +1451,7 @@ class BirdBuddyDownloader:
 
             self.last_sync_time = datetime.now(timezone.utc)
             self.last_sync_downloaded = total_new
+            self.last_sync_downloaded_count = total_new
             self.last_sync_status = "Success"
             self.last_error = None
         except Exception as e:
@@ -2221,7 +2223,10 @@ async def handle_api_status(request: web.Request) -> web.Response:
             downloader.last_sync_time.isoformat() if downloader.last_sync_time else None
         ),
         "last_sync_status": downloader.last_sync_status,
-        "last_sync_downloaded_count": downloader.last_sync_downloaded_count,
+        "last_sync_downloaded": getattr(downloader, "last_sync_downloaded", 0),
+        "last_sync_downloaded_count": getattr(
+            downloader, "last_sync_downloaded_count", 0
+        ),
         "next_sync_time": (
             downloader.next_sync_time.isoformat() if downloader.next_sync_time else None
         ),
