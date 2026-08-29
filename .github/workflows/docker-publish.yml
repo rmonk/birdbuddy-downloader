@@ -6,12 +6,17 @@ on:
       - main
     tags:
       - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build-and-push:
     name: Build & Push to Docker Hub
     runs-on: ubuntu-latest
+    # Only build on push/tags/dispatch OR pull requests from internal repository branches (never forks)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
       - name: Checkout repository
@@ -35,10 +40,10 @@ jobs:
         with:
           images: docker.io/moosemouse/birdbuddy-downloader
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+            type=raw,value=pr-${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6

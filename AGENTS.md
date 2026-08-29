@@ -61,6 +61,7 @@ birdbuddy-downloader/
 - `pybirdbuddy`: Unofficial GraphQL client for Bird Buddy.
 - `python-dotenv`: Environment variable loading from `.env`.
 - `piexif` & `pillow`: EXIF manipulation and image handling.
+- `opencv-python-headless` & `numpy`: Image sharpness calculation (variance of Laplacian).
 - `requests` & `aiohttp`: HTTP requests, async downloading, and embedded web status server.
 
 ---
@@ -77,19 +78,29 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     media_type TEXT,
     created_at TEXT,
     downloaded_at TEXT,
-    file_path TEXT
+    file_path TEXT,
+    sighting_id TEXT,
+    sharpness_score REAL,
+    is_deleted INTEGER DEFAULT 0,
+    trash_path TEXT,
+    deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
 CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
 CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
+CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id);
+CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 ```
 
 ### Key Functions & Classes
 - `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, state tracking, and media downloading.
+- `calculate_image_sharpness()`: Computes variance of Laplacian on grayscale image data (`cv2.Laplacian(gray, cv2.CV_64F).var()`).
+- `get_recent_sightings()`: Queries media from the past 7 days grouped by `sighting_id`, tagging the sharpest photo per sighting and tracking active vs removed items.
+- `soft_delete_media()` / `restore_media()`: Safely moves deleted files to `.trash/` or restores them to original path.
+- `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days); permanently removes aged `.trash/` files from disk while preserving active files.
 - `get_feeder_download_stats()`: Queries SQLite for per-feeder download breakdown (past hour, 24 hours, 7 days, all-time totals, and recent activity).
-- `create_web_app()`: Sets up the asynchronous `aiohttp.web` dashboard serving HTML and `/api/status` & `/api/sync` endpoints.
+- `create_web_app()`: Sets up the asynchronous `aiohttp.web` dashboard serving HTML and `/api/status`, `/api/sightings`, `/api/media/{id}/view`, `/api/media/{id}/thumb`, `/api/media/delete`, `/api/media/restore`, `/api/sync` endpoints.
 - `get_latest_download_timestamp()`: Finds the max `created_at` timestamp in SQLite to calculate the incremental sync cutoff.
-- `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days) from SQLite after each run.
 - `build_template_vars()`: Generates a dictionary of metadata placeholders (`feeder_name`, `species_name`, `detection_id`, `postcard_id`, `sighting_id`, `year`, `month`, `day`, `media_id_short`, etc.).
 - `render_dest_path()`: Safely formats directory and filename strings using `SafeDict` to prevent `KeyError` crashes, sanitizes path components, and ensures correct extensions (`.jpg`/`.mp4`).
 - `download_file()`: Downloads files atomically to `.tmp` files first with explicit socket timeouts, replacing destination upon completion.

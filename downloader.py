@@ -13,6 +13,11 @@ Features:
 - Configurable database retention cleanup after each run (--db-retention-days)
 - Supports single-run mode (cron-friendly) or continuous polling mode (--interval)
 - Embedded web interface showing sync interval, last sync, next sync, and per-feeder download statistics (past hour, day, week)
+- Sighting-based event grouping showing the past week's downloads (default 5 sets, expandable)
+- OpenCV variance of Laplacian sharpness calculation with '⭐ Sharpest' image highlight per sighting
+- Soft-delete moving files to temporary trash storage with visible 'Removed' state and 'Restore' action
+- Permanent disk purge of aged-out deleted files during retention cleanup
+- Interactive full-size image lightbox viewer with thumbnails
 - Provides detailed camera information, battery levels, species media counts, and event date ranges
 - Supports --dry-run mode to list items that would be downloaded vs skipped
 - Persistent authentication with automatic token refresh to prevent API rate-limiting
@@ -22,10 +27,12 @@ Features:
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import sys
@@ -33,6 +40,8 @@ import time
 from datetime import datetime, timezone, timedelta
 import aiohttp
 from aiohttp import web
+import cv2
+import numpy as np
 import requests
 from dotenv import load_dotenv
 
@@ -66,16 +75,23 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     media_type TEXT,
     created_at TEXT,
     downloaded_at TEXT,
-    file_path TEXT
+    file_path TEXT,
+    sighting_id TEXT,
+    sharpness_score REAL,
+    is_deleted INTEGER DEFAULT 0,
+    trash_path TEXT,
+    deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
 CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
 CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
+CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id);
+CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 """
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
-    """Initialize SQLite database for tracking downloaded media."""
+    """Initialize SQLite database for tracking downloaded media and perform schema migrations."""
     db_dir = os.path.dirname(os.path.abspath(db_path))
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -84,11 +100,59 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     with conn:
         conn.executescript(DB_SCHEMA)
+
+        # Migrate existing tables if columns are missing
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(downloaded_media)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+
+        if "sighting_id" not in existing_cols:
+            cursor.execute("ALTER TABLE downloaded_media ADD COLUMN sighting_id TEXT")
+        if "sharpness_score" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE downloaded_media ADD COLUMN sharpness_score REAL"
+            )
+        if "is_deleted" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE downloaded_media ADD COLUMN is_deleted INTEGER DEFAULT 0"
+            )
+        if "trash_path" not in existing_cols:
+            cursor.execute("ALTER TABLE downloaded_media ADD COLUMN trash_path TEXT")
+        if "deleted_at" not in existing_cols:
+            cursor.execute("ALTER TABLE downloaded_media ADD COLUMN deleted_at TEXT")
+
+        # Ensure indexes exist
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted)"
+        )
+
     return conn
 
 
+def calculate_image_sharpness(image_path: str) -> float | None:
+    """Calculate image sharpness score using the variance of Laplacian method (higher = sharper)."""
+    if not image_path or not os.path.exists(image_path):
+        return None
+    try:
+        with open(image_path, "rb") as f:
+            img_bytes = f.read()
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return round(float(lap_var), 2)
+    except Exception as e:
+        logger.debug(f"Failed to calculate sharpness for {image_path}: {e}")
+        return None
+
+
 def is_media_downloaded(conn: sqlite3.Connection, media_id: str) -> bool:
-    """Check if a media item has already been downloaded."""
+    """Check if a media item has already been recorded in the database."""
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM downloaded_media WHERE media_id = ?", (media_id,))
     return cursor.fetchone() is not None
@@ -103,6 +167,8 @@ def record_media_downloaded(
     media_type: str,
     created_at: str,
     file_path: str,
+    sighting_id: str | None = None,
+    sharpness_score: float | None = None,
 ):
     """Record media item in database after successful download."""
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -110,8 +176,8 @@ def record_media_downloaded(
         conn.execute(
             """
             INSERT OR REPLACE INTO downloaded_media
-            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path, sighting_id, sharpness_score, is_deleted, trash_path, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
             """,
             (
                 media_id,
@@ -122,8 +188,80 @@ def record_media_downloaded(
                 created_at,
                 now_iso,
                 file_path,
+                sighting_id,
+                sharpness_score,
             ),
         )
+
+
+def soft_delete_media(
+    conn: sqlite3.Connection, download_dir: str, media_id: str
+) -> bool:
+    """Move media file to temporary .trash/ storage and mark is_deleted = 1."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT file_path, is_deleted, trash_path FROM downloaded_media WHERE media_id = ?",
+        (media_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False
+    file_path, is_deleted, current_trash = row[0], row[1], row[2]
+    if is_deleted:
+        return True
+
+    trash_dir = os.path.join(download_dir, ".trash")
+    os.makedirs(trash_dir, exist_ok=True)
+    filename = os.path.basename(file_path) if file_path else f"{media_id}_file.tmp"
+    target_trash_path = os.path.join(trash_dir, f"{media_id}_{filename}")
+
+    if file_path and os.path.exists(file_path):
+        try:
+            shutil.move(file_path, target_trash_path)
+        except Exception as e:
+            logger.error(f"Failed to move {file_path} to {target_trash_path}: {e}")
+            target_trash_path = file_path
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            "UPDATE downloaded_media SET is_deleted = 1, trash_path = ?, deleted_at = ? WHERE media_id = ?",
+            (target_trash_path, now_iso, media_id),
+        )
+    logger.info(
+        f"Media {media_id} soft-deleted to temporary trash: {target_trash_path}"
+    )
+    return True
+
+
+def restore_media(conn: sqlite3.Connection, media_id: str) -> bool:
+    """Restore soft-deleted media file from .trash/ back to its original location."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT file_path, trash_path, is_deleted FROM downloaded_media WHERE media_id = ?",
+        (media_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False
+    file_path, trash_path, is_deleted = row[0], row[1], row[2]
+    if not is_deleted:
+        return True
+
+    if trash_path and os.path.exists(trash_path) and file_path:
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            shutil.move(trash_path, file_path)
+        except Exception as e:
+            logger.error(f"Failed to restore {trash_path} to {file_path}: {e}")
+
+    with conn:
+        conn.execute(
+            "UPDATE downloaded_media SET is_deleted = 0, trash_path = NULL, deleted_at = NULL WHERE media_id = ?",
+            (media_id,),
+        )
+    logger.info(f"Media {media_id} restored to: {file_path}")
+    return True
 
 
 def get_latest_download_timestamp(conn: sqlite3.Connection) -> datetime | None:
@@ -141,22 +279,41 @@ def get_latest_download_timestamp(conn: sqlite3.Connection) -> datetime | None:
 
 
 def cleanup_old_db_records(conn: sqlite3.Connection, retention_days: int = 14) -> int:
-    """Delete records from downloaded_media database where created_at is older than retention_days."""
+    """
+    Delete records from downloaded_media database where created_at is older than retention_days.
+    For soft-deleted records (is_deleted = 1), permanently purges the file from .trash/ on disk.
+    For active records (is_deleted = 0), downloaded media files remain untouched.
+    """
     if retention_days <= 0:
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     cursor = conn.cursor()
-    cursor.execute("SELECT media_id, created_at FROM downloaded_media")
+    cursor.execute(
+        "SELECT media_id, created_at, is_deleted, trash_path FROM downloaded_media"
+    )
     rows = cursor.fetchall()
     to_delete = []
-    for media_id, created_at_str in rows:
+    purged_files = 0
+    for media_id, created_at_str, is_del, trash_path in rows:
         dt = parse_iso_datetime(created_at_str)
         if dt and dt < cutoff:
             to_delete.append(media_id)
+            if is_del and trash_path and os.path.exists(trash_path):
+                try:
+                    os.remove(trash_path)
+                    purged_files += 1
+                    logger.info(
+                        f"Purged aged-out deleted file from trash: {trash_path}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not remove aged trash file {trash_path}: {e}"
+                    )
 
     if to_delete:
         cursor.executemany(
-            "DELETE FROM downloaded_media WHERE media_id = ?", [(m,) for m in to_delete]
+            "DELETE FROM downloaded_media WHERE media_id = ?",
+            [(m,) for m in to_delete],
         )
         conn.commit()
     return len(to_delete)
@@ -174,22 +331,21 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
 
     cursor = conn.cursor()
 
-    # Query all feeder statistics
     query = """
     SELECT
         COALESCE(NULLIF(feeder_name, ''), 'Bird Buddy') as feeder,
         -- Past hour
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' THEN 1 ELSE 0 END) as h_images,
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' THEN 1 ELSE 0 END) as h_videos,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' AND is_deleted = 0 THEN 1 ELSE 0 END) as h_images,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' AND is_deleted = 0 THEN 1 ELSE 0 END) as h_videos,
         -- Past 24 hours
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' THEN 1 ELSE 0 END) as d_images,
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' THEN 1 ELSE 0 END) as d_videos,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' AND is_deleted = 0 THEN 1 ELSE 0 END) as d_images,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' AND is_deleted = 0 THEN 1 ELSE 0 END) as d_videos,
         -- Past 7 days
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' THEN 1 ELSE 0 END) as w_images,
-        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' THEN 1 ELSE 0 END) as w_videos,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'image' AND is_deleted = 0 THEN 1 ELSE 0 END) as w_images,
+        SUM(CASE WHEN downloaded_at >= ? AND media_type = 'video' AND is_deleted = 0 THEN 1 ELSE 0 END) as w_videos,
         -- All time
-        SUM(CASE WHEN media_type = 'image' THEN 1 ELSE 0 END) as total_images,
-        SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) as total_videos,
+        SUM(CASE WHEN media_type = 'image' AND is_deleted = 0 THEN 1 ELSE 0 END) as total_images,
+        SUM(CASE WHEN media_type = 'video' AND is_deleted = 0 THEN 1 ELSE 0 END) as total_videos,
         MAX(downloaded_at) as latest_download
     FROM downloaded_media
     GROUP BY feeder
@@ -198,7 +354,14 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
 
     cursor.execute(
         query,
-        (hour_cutoff, hour_cutoff, day_cutoff, day_cutoff, week_cutoff, week_cutoff),
+        (
+            hour_cutoff,
+            hour_cutoff,
+            day_cutoff,
+            day_cutoff,
+            week_cutoff,
+            week_cutoff,
+        ),
     )
     rows = cursor.fetchall()
 
@@ -220,9 +383,21 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
 
         feeders[fname] = {
             "feeder_name": fname,
-            "past_hour": {"images": h_img, "videos": h_vid, "total": h_img + h_vid},
-            "past_day": {"images": d_img, "videos": d_vid, "total": d_img + d_vid},
-            "past_week": {"images": w_img, "videos": w_vid, "total": w_img + w_vid},
+            "past_hour": {
+                "images": h_img,
+                "videos": h_vid,
+                "total": h_img + h_vid,
+            },
+            "past_day": {
+                "images": d_img,
+                "videos": d_vid,
+                "total": d_img + d_vid,
+            },
+            "past_week": {
+                "images": w_img,
+                "videos": w_vid,
+                "total": w_img + w_vid,
+            },
             "all_time": {
                 "images": tot_img,
                 "videos": tot_vid,
@@ -247,34 +422,109 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
         totals["all_time"]["videos"] += tot_vid
         totals["all_time"]["total"] += tot_img + tot_vid
 
-    # Recent downloads
-    cursor.execute("""
-        SELECT media_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path
-        FROM downloaded_media
-        ORDER BY downloaded_at DESC
-        LIMIT 15
-        """)
-    recent_rows = cursor.fetchall()
-    recent_downloads = []
-    for r in recent_rows:
-        recent_downloads.append(
-            {
-                "media_id": r[0],
-                "feeder_name": r[1] or "Bird Buddy",
-                "species_name": r[2] or "Unknown",
-                "media_type": r[3],
-                "created_at": r[4],
-                "downloaded_at": r[5],
-                "filename": os.path.basename(r[6]) if r[6] else "",
-            }
-        )
-
     return {
         "generated_at": now.isoformat(),
         "feeders": feeders,
         "totals": totals,
-        "recent_downloads": recent_downloads,
     }
+
+
+def get_recent_sightings(
+    conn: sqlite3.Connection, days: int = 7, limit: int = 0
+) -> list[dict]:
+    """
+    Query media from the past `days` grouped by sighting_id.
+    Identifies the sharpest image per sighting and includes both active and removed items.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).isoformat()
+    cursor = conn.cursor()
+
+    query = """
+    SELECT
+        COALESCE(NULLIF(sighting_id, ''), media_id) as group_sighting_id,
+        media_id,
+        COALESCE(NULLIF(feeder_name, ''), 'Bird Buddy') as feeder_name,
+        COALESCE(NULLIF(species_name, ''), 'Unknown Species') as species_name,
+        media_type,
+        created_at,
+        downloaded_at,
+        file_path,
+        sharpness_score,
+        is_deleted,
+        trash_path
+    FROM downloaded_media
+    WHERE downloaded_at >= ?
+    ORDER BY created_at DESC, downloaded_at DESC
+    """
+    cursor.execute(query, (cutoff,))
+    rows = cursor.fetchall()
+
+    sightings_dict = {}
+    for row in rows:
+        s_id = row[0]
+        m_id = row[1]
+        fname = row[2]
+        species = row[3]
+        mtype = row[4]
+        c_at = row[5]
+        dl_at = row[6]
+        fpath = row[7]
+        sharpness = row[8]
+        is_del = bool(row[9])
+        tpath = row[10]
+
+        if s_id not in sightings_dict:
+            sightings_dict[s_id] = {
+                "sighting_id": s_id,
+                "feeder_name": fname,
+                "species_name": species,
+                "created_at": c_at,
+                "latest_downloaded_at": dl_at,
+                "images": [],
+                "videos": [],
+                "total_items": 0,
+            }
+
+        media_info = {
+            "media_id": m_id,
+            "media_type": mtype,
+            "created_at": c_at,
+            "downloaded_at": dl_at,
+            "file_path": fpath,
+            "sharpness_score": sharpness,
+            "is_deleted": is_del,
+            "trash_path": tpath,
+            "filename": (
+                os.path.basename(fpath)
+                if fpath
+                else f"{m_id}.{('jpg' if mtype == 'image' else 'mp4')}"
+            ),
+            "is_sharpest": False,
+        }
+
+        if mtype == "video":
+            sightings_dict[s_id]["videos"].append(media_info)
+        else:
+            sightings_dict[s_id]["images"].append(media_info)
+        sightings_dict[s_id]["total_items"] += 1
+
+    sightings_list = list(sightings_dict.values())
+
+    # For each sighting, identify the sharpest image
+    for s in sightings_list:
+        images = s["images"]
+        if images:
+            valid_images = [img for img in images if img["sharpness_score"] is not None]
+            if valid_images:
+                active_images = [img for img in valid_images if not img["is_deleted"]]
+                pool = active_images if active_images else valid_images
+                max_img = max(pool, key=lambda x: x["sharpness_score"])
+                max_img["is_sharpest"] = True
+
+    if limit > 0:
+        return sightings_list[:limit]
+    return sightings_list
 
 
 def sanitize_filename(name: str) -> str:
@@ -494,6 +744,7 @@ def render_dest_path(
 
 
 class BirdBuddyDownloader:
+
     def __init__(self, args, conn: sqlite3.Connection):
         self.args = args
         self.conn = conn
@@ -550,7 +801,6 @@ class BirdBuddyDownloader:
             self.last_error = "Credentials missing"
             return False
 
-        # Attempt to reuse existing BirdBuddy instance & refresh session tokens
         if self.bb is not None:
             try:
                 success = await self.bb.refresh()
@@ -568,7 +818,6 @@ class BirdBuddyDownloader:
                     f"Session refresh failed ({e}); re-authenticating with credentials..."
                 )
 
-        # Create new BirdBuddy instance and perform full authentication
         logger.info(f"Authenticating with Bird Buddy account: {username}")
         self.bb = BirdBuddy(username, password)
         try:
@@ -651,6 +900,11 @@ class BirdBuddyDownloader:
                 and os.path.exists(dest_path)
                 and not self.args.dry_run
             ):
+                sharpness = (
+                    calculate_image_sharpness(dest_path)
+                    if media_type == "image"
+                    else None
+                )
                 record_media_downloaded(
                     self.conn,
                     media_id,
@@ -660,6 +914,8 @@ class BirdBuddyDownloader:
                     media_type,
                     created_at_str,
                     dest_path,
+                    sighting_id=sighting_id or postcard_id,
+                    sharpness_score=sharpness,
                 )
             logger.debug(f"Media {media_id} already downloaded. Skipping.")
             return "skipped"
@@ -674,13 +930,18 @@ class BirdBuddyDownloader:
             f"Downloading [{media_type.upper()}] from '{feeder_name}' ({species_name}): {filename}"
         )
         success = await download_file(
-            content_url, dest_path, stop_checker=lambda: self.stop_requested
+            content_url,
+            dest_path,
+            stop_checker=lambda: self.stop_requested,
         )
         if success and not self.stop_requested:
             if dt:
                 apply_timestamps_and_exif(
                     dest_path, dt, is_image=(media_type == "image")
                 )
+            sharpness = (
+                calculate_image_sharpness(dest_path) if media_type == "image" else None
+            )
             record_media_downloaded(
                 self.conn,
                 media_id,
@@ -690,8 +951,13 @@ class BirdBuddyDownloader:
                 media_type,
                 created_at_str,
                 dest_path,
+                sighting_id=sighting_id or postcard_id,
+                sharpness_score=sharpness,
             )
-            logger.info(f"Successfully downloaded and timestamped: {dest_path}")
+            sharp_str = f" (Sharpness: {sharpness})" if sharpness else ""
+            logger.info(
+                f"Successfully downloaded and timestamped: {dest_path}{sharp_str}"
+            )
             return "downloaded"
         return "filtered"
 
@@ -700,7 +966,6 @@ class BirdBuddyDownloader:
         mode_str = " (Dry-Run mode)" if self.args.dry_run else ""
         logger.info(f"Syncing media from feed{mode_str}...")
 
-        # Calculate incremental sync cutoff if full sync is not forced
         feed_cutoff_dt = None
         if not getattr(self.args, "full_sync", False):
             latest_db_dt = get_latest_download_timestamp(self.conn)
@@ -751,7 +1016,6 @@ class BirdBuddyDownloader:
                 node = edge.node
                 node_created_at = node.created_at
 
-                # Stop pagination if node is older than feed_cutoff_dt
                 if (
                     feed_cutoff_dt
                     and node_created_at
@@ -979,7 +1243,11 @@ class BirdBuddyDownloader:
                 while not self.stop_requested:
                     media_data = await self.bb._make_request(
                         query=me_queries.COLLECTIONS_MEDIA,
-                        variables={"collectionId": cid, "first": 50, "after": cursor},
+                        variables={
+                            "collectionId": cid,
+                            "first": 50,
+                            "after": cursor,
+                        },
                     )
                     collection_obj = media_data.get("collection", {})
                     media_conn = (
@@ -1060,6 +1328,7 @@ class BirdBuddyDownloader:
                    MAX(created_at) as latest,
                    COUNT(*) as total_media
             FROM downloaded_media
+            WHERE is_deleted = 0
             GROUP BY feeder_name
             """)
         for row in cursor.fetchall():
@@ -1116,6 +1385,7 @@ class BirdBuddyDownloader:
                    SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) as videos,
                    COUNT(*) as total
             FROM downloaded_media
+            WHERE is_deleted = 0
             GROUP BY species_name
             ORDER BY total DESC
             """)
@@ -1155,7 +1425,6 @@ class BirdBuddyDownloader:
                 coll_count = await self.sync_collections()
                 total_new += coll_count
 
-            # Database cleanup for entries older than db_retention_days (default 14 days)
             if not self.stop_requested and not self.args.dry_run:
                 retention_days = getattr(self.args, "db_retention_days", 14)
                 if retention_days > 0:
@@ -1192,26 +1461,36 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       --bg-primary: #0f172a;
       --bg-secondary: #1e293b;
       --bg-card: #334155;
+      --bg-card-hover: #3b4d66;
       --text-primary: #f8fafc;
       --text-secondary: #94a3b8;
       --accent: #10b981;
       --accent-hover: #059669;
       --border: #475569;
       --danger: #ef4444;
+      --danger-hover: #dc2626;
       --warning: #f59e0b;
       --badge-blue: #3b82f6;
+      --gold: #fbbf24;
+      --gold-bg: rgba(251, 191, 36, 0.2);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
     body { background-color: var(--bg-primary); color: var(--text-primary); padding: 24px; min-height: 100vh; }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1280px; margin: 0 auto; }
     header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 16px; }
     .header-title { display: flex; align-items: center; gap: 12px; }
     .header-title h1 { font-size: 1.6rem; font-weight: 700; color: #fff; }
     .header-title .icon { font-size: 1.8rem; }
     .header-actions { display: flex; align-items: center; gap: 12px; }
-    .btn { background-color: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.9rem; transition: background 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+    .btn { background-color: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.9rem; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
     .btn:hover { background-color: var(--accent-hover); }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-danger { background-color: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); padding: 4px 10px; font-size: 0.78rem; border-radius: 4px; }
+    .btn-danger:hover { background-color: var(--danger); color: white; }
+    .btn-restore { background-color: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); padding: 4px 10px; font-size: 0.78rem; border-radius: 4px; }
+    .btn-restore:hover { background-color: #2563eb; color: white; }
+    .btn-secondary { background-color: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); }
+    .btn-secondary:hover { background-color: var(--border); }
     .auto-refresh { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-secondary); }
     
     /* Metrics Grid */
@@ -1227,11 +1506,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .badge-syncing { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); animation: pulse 1.5s infinite; }
     .badge-error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     .badge-idle { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.4); }
+    .badge-sharpest { background: var(--gold-bg); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.5); font-weight: 700; }
+    .badge-removed { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-    /* Table Section */
+    /* Sections */
     .section { background-color: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
-    .section-title { font-size: 1.15rem; font-weight: 600; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+    .section-title { font-size: 1.15rem; font-weight: 600; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
     .table-container { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
     th { background-color: rgba(51, 65, 85, 0.5); color: var(--text-secondary); font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; padding: 12px 14px; border-bottom: 1px solid var(--border); }
@@ -1243,6 +1524,38 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .pill-img { background: rgba(59, 130, 246, 0.15); color: #93c5fd; }
     .pill-vid { background: rgba(245, 158, 11, 0.15); color: #fcd34d; }
     .empty-state { text-align: center; padding: 32px; color: var(--text-secondary); font-style: italic; }
+
+    /* Sighting Groups */
+    .sighting-card { background: var(--bg-card); border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); margin-bottom: 20px; overflow: hidden; }
+    .sighting-header { background: rgba(15, 23, 42, 0.4); padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; gap: 10px; }
+    .sighting-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .sighting-species { font-size: 1.1rem; font-weight: 700; color: #fff; }
+    .sighting-feeder { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4); padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+    .sighting-id-tag { color: var(--text-secondary); font-family: monospace; font-size: 0.8rem; }
+    .sighting-body { padding: 16px; }
+    .media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; }
+    
+    /* Media Tile */
+    .media-tile { background: var(--bg-secondary); border-radius: 6px; border: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; position: relative; transition: transform 0.2s, box-shadow 0.2s; }
+    .media-tile:hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.25); }
+    .media-tile.deleted { opacity: 0.55; border-color: rgba(239, 68, 68, 0.5); filter: grayscale(40%); }
+    .media-tile.sharpest-tile { border: 2px solid var(--gold); }
+    .thumb-wrapper { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; cursor: pointer; overflow: hidden; }
+    .thumb-img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.3s; }
+    .thumb-wrapper:hover .thumb-img { transform: scale(1.04); }
+    .video-badge-icon { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 2rem; color: white; text-shadow: 0 2px 8px rgba(0,0,0,0.8); pointer-events: none; }
+    .tile-overlay-top { position: absolute; top: 6px; left: 6px; right: 6px; display: flex; justify-content: space-between; align-items: center; pointer-events: none; }
+    .tile-footer { padding: 10px; display: flex; flex-direction: column; gap: 6px; font-size: 0.8rem; }
+    .tile-details { display: flex; justify-content: space-between; color: var(--text-secondary); }
+    .tile-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+
+    /* Modal Viewer */
+    .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(4px); justify-content: center; align-items: center; }
+    .modal.active { display: flex; }
+    .modal-content { max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; align-items: center; }
+    .modal-media { max-width: 90vw; max-height: 80vh; object-fit: contain; border-radius: 6px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+    .modal-caption { margin-top: 12px; color: var(--text-primary); font-size: 0.95rem; text-align: center; }
+    .modal-close { position: absolute; top: 20px; right: 24px; font-size: 2rem; color: #fff; cursor: pointer; border: none; background: none; }
 
     /* Hardware Cards */
     .feeder-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
@@ -1259,7 +1572,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <span class="icon">🐦</span>
         <div>
           <h1>Bird Buddy Downloader</h1>
-          <div style="font-size: 0.8rem; color: var(--text-secondary);">Automated Media Synchronization & Activity Dashboard</div>
+          <div style="font-size: 0.8rem; color: var(--text-secondary);">Automated Media Synchronization & Sighting Event Dashboard</div>
         </div>
       </div>
       <div class="header-actions">
@@ -1290,16 +1603,32 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <div class="card-sub" id="lastSyncDownloaded">Downloaded in last run: 0 items</div>
       </div>
       <div class="card">
-        <div class="card-label">Total Downloads (All Time)</div>
+        <div class="card-label">Active Downloads (All Time)</div>
         <div class="card-value" id="totalAllTime">--</div>
         <div class="card-sub" id="totalBreakdown">-- images | -- videos</div>
+      </div>
+    </div>
+
+    <!-- Sighting Event Downloads Section -->
+    <div class="section">
+      <div class="section-title">
+        <span>📸 Recent Media Downloads (Grouped by Sighting Event)</span>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button class="btn btn-secondary" id="toggleSightingsBtn" onclick="toggleAllSightings()" style="padding: 4px 12px; font-size: 0.8rem;">
+            Show All Past 7 Days
+          </button>
+          <span id="sightingsCountBadge" class="pill pill-img">5 Sets</span>
+        </div>
+      </div>
+      <div id="sightingsContainer">
+        <div class="empty-state">Loading recent detection sightings...</div>
       </div>
     </div>
 
     <!-- Per-Feeder Download Breakdown Table -->
     <div class="section">
       <div class="section-title">
-        <span>📸 Feeder Media Downloads (Past Hour / Day / Week)</span>
+        <span>📊 Feeder Media Downloads (Past Hour / Day / Week)</span>
         <span id="statsUpdated" style="font-size: 0.8rem; color: var(--text-secondary); font-weight: normal;"></span>
       </div>
       <div class="table-container">
@@ -1326,31 +1655,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div class="section-title">📡 Connected Feeders Hardware Status</div>
       <div class="feeder-grid" id="hardwareGrid"></div>
     </div>
+  </div>
 
-    <!-- Recent Activity Log -->
-    <div class="section">
-      <div class="section-title">🕒 Recent Media Downloads</div>
-      <div class="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Timestamp</th>
-              <th>Feeder</th>
-              <th>Species</th>
-              <th>Type</th>
-              <th>Saved File</th>
-            </tr>
-          </thead>
-          <tbody id="recentMediaBody">
-            <tr><td colspan="5" class="empty-state">No recent downloads found.</td></tr>
-          </tbody>
-        </table>
-      </div>
+  <!-- Lightbox Modal Viewer -->
+  <div id="mediaModal" class="modal" onclick="closeModal(event)">
+    <button class="modal-close" onclick="closeModal(event)">&times;</button>
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div id="modalMediaContainer"></div>
+      <div class="modal-caption" id="modalCaption"></div>
     </div>
   </div>
 
   <script>
     let refreshTimer = null;
+    let showingAllSightings = false;
 
     function formatRelative(isoStr) {
       if (!isoStr) return "Never";
@@ -1464,7 +1782,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </tr>`;
           });
 
-          // Append totals row
           html += `<tr style="background: rgba(51, 65, 85, 0.4); font-weight: bold;">
             <td>TOTALS</td>
             <td class="num"><span class="pill pill-img">${totals.past_hour.images}</span> <span class="pill pill-vid">${totals.past_hour.videos}</span> (${totals.past_hour.total})</td>
@@ -1497,29 +1814,167 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           document.getElementById("hardwareGrid").innerHTML = hwHtml;
         }
 
-        // 7. Update Recent Media Table
-        const recentTbody = document.getElementById("recentMediaBody");
-        const recents = data.stats.recent_downloads || [];
-        if (recents.length === 0) {
-          recentTbody.innerHTML = '<tr><td colspan="5" class="empty-state">No downloaded media found yet.</td></tr>';
-        } else {
-          let rHtml = "";
-          recents.forEach(r => {
-            const isVid = r.media_type === "video";
-            rHtml += `<tr>
-              <td style="color:var(--text-secondary); font-size:0.85rem;">${formatRelative(r.downloaded_at)}</td>
-              <td>${escapeHtml(r.feeder_name)}</td>
-              <td><strong>${escapeHtml(r.species_name)}</strong></td>
-              <td><span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${r.media_type.toUpperCase()}</span></td>
-              <td style="font-family:monospace; font-size:0.8rem; color:#94a3b8;">${escapeHtml(r.filename)}</td>
-            </tr>`;
-          });
-          recentTbody.innerHTML = rHtml;
-        }
+        // 7. Render Sighting Event Groups
+        renderSightings(data.sightings || []);
 
       } catch (err) {
         console.error("Dashboard error:", err);
       }
+    }
+
+    function renderSightings(sightings) {
+      const container = document.getElementById("sightingsContainer");
+      if (!sightings || sightings.length === 0) {
+        container.innerHTML = '<div class="empty-state">No sightings recorded in the past week.</div>';
+        return;
+      }
+
+      let html = "";
+      sightings.forEach(s => {
+        const mediaItems = [...s.images, ...s.videos];
+        const sTime = formatRelative(s.created_at || s.latest_downloaded_at);
+
+        html += `<div class="sighting-card">
+          <div class="sighting-header">
+            <div class="sighting-info">
+              <span class="sighting-species">${escapeHtml(s.species_name)}</span>
+              <span class="sighting-feeder">${escapeHtml(s.feeder_name)}</span>
+              <span class="sighting-id-tag">ID: ${escapeHtml(s.sighting_id.substring(0, 8))}</span>
+            </div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+              Captured: ${sTime} (${s.images.length} photos, ${s.videos.length} videos)
+            </div>
+          </div>
+          <div class="sighting-body">
+            <div class="media-grid">`;
+
+        mediaItems.forEach(m => {
+          const isVid = m.media_type === "video";
+          const isDeleted = m.is_deleted;
+          const isSharpest = m.is_sharpest && !isDeleted;
+          const sharpScore = m.sharpness_score != null ? m.sharpness_score.toFixed(1) : null;
+          const viewUrl = `/api/media/${m.media_id}/view`;
+          const thumbUrl = `/api/media/${m.media_id}/thumb`;
+
+          let tileClass = "media-tile";
+          if (isDeleted) tileClass += " deleted";
+          if (isSharpest) tileClass += " sharpest-tile";
+
+          html += `<div class="${tileClass}" id="tile-${m.media_id}">
+            <div class="thumb-wrapper" onclick="openModal('${m.media_id}', '${m.media_type}', '${escapeHtml(s.species_name)}', '${escapeHtml(s.feeder_name)}', '${sharpScore || ''}', ${isSharpest})">
+              ${isVid ? `<video class="thumb-img" src="${viewUrl}" preload="metadata"></video><span class="video-badge-icon">▶</span>` : `<img class="thumb-img" src="${thumbUrl}" alt="bird photo" loading="lazy">`}
+              <div class="tile-overlay-top">
+                <span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${m.media_type.toUpperCase()}</span>
+                ${isSharpest ? `<span class="badge badge-sharpest">⭐ Sharpest</span>` : ''}
+                ${isDeleted ? `<span class="badge badge-removed">[Removed]</span>` : ''}
+              </div>
+            </div>
+            <div class="tile-footer">
+              <div class="tile-details">
+                <span>${sharpScore ? 'Sharpness: <strong>' + sharpScore + '</strong>' : (isVid ? 'Video Clip' : '')}</span>
+                <span>${formatRelative(m.created_at)}</span>
+              </div>
+              <div class="tile-actions">
+                ${isDeleted ?
+                  `<button class="btn btn-restore" onclick="restoreMedia('${m.media_id}')">↩️ Restore</button>` :
+                  `<button class="btn btn-danger" onclick="deleteMedia('${m.media_id}')">🗑️ Delete</button>`
+                }
+              </div>
+            </div>
+          </div>`;
+        });
+
+        html += `   </div>
+          </div>
+        </div>`;
+      });
+
+      container.innerHTML = html;
+    }
+
+    async function toggleAllSightings() {
+      showingAllSightings = !showingAllSightings;
+      const btn = document.getElementById("toggleSightingsBtn");
+      const badge = document.getElementById("sightingsCountBadge");
+
+      if (showingAllSightings) {
+        btn.innerText = "Show Recent 5 Sets";
+        badge.innerText = "All (7 Days)";
+        try {
+          const resp = await fetch("/api/sightings?limit=0&days=7");
+          const data = await resp.json();
+          renderSightings(data.sightings || []);
+        } catch (e) {
+          console.error("Error fetching all sightings:", e);
+        }
+      } else {
+        btn.innerText = "Show All Past 7 Days";
+        badge.innerText = "5 Sets";
+        loadStatus();
+      }
+    }
+
+    async function deleteMedia(mediaId) {
+      try {
+        const resp = await fetch("/api/media/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ media_id: mediaId })
+        });
+        if (resp.ok) {
+          if (showingAllSightings) {
+            toggleAllSightings();
+            toggleAllSightings();
+          } else {
+            loadStatus();
+          }
+        }
+      } catch (e) {
+        alert("Failed to delete media: " + e.message);
+      }
+    }
+
+    async function restoreMedia(mediaId) {
+      try {
+        const resp = await fetch("/api/media/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ media_id: mediaId })
+        });
+        if (resp.ok) {
+          if (showingAllSightings) {
+            toggleAllSightings();
+            toggleAllSightings();
+          } else {
+            loadStatus();
+          }
+        }
+      } catch (e) {
+        alert("Failed to restore media: " + e.message);
+      }
+    }
+
+    function openModal(mediaId, mediaType, species, feeder, sharpness, isSharpest) {
+      const container = document.getElementById("modalMediaContainer");
+      const caption = document.getElementById("modalCaption");
+      const viewUrl = `/api/media/${mediaId}/view`;
+
+      if (mediaType === "video") {
+        container.innerHTML = `<video class="modal-media" src="${viewUrl}" controls autoplay></video>`;
+      } else {
+        container.innerHTML = `<img class="modal-media" src="${viewUrl}" alt="${species}">`;
+      }
+
+      let sharpText = sharpness ? ` | Sharpness Variance: <strong>${sharpness}</strong>` : '';
+      if (isSharpest) sharpText += ' <span style="color:var(--gold); font-weight:bold;">(⭐ Sharpest of Sighting)</span>';
+      caption.innerHTML = `<strong>${species}</strong> - ${feeder}${sharpText}`;
+
+      document.getElementById("mediaModal").classList.add("active");
+    }
+
+    function closeModal(e) {
+      document.getElementById("mediaModal").classList.remove("active");
+      document.getElementById("modalMediaContainer").innerHTML = "";
     }
 
     async function triggerSync() {
@@ -1565,9 +2020,10 @@ async def handle_index(request: web.Request) -> web.Response:
 
 
 async def handle_api_status(request: web.Request) -> web.Response:
-    """Return JSON status report including sync info and per-feeder download counts."""
+    """Return JSON status report including sync info, feeder statistics, and top 5 recent sightings."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
     stats = get_feeder_download_stats(downloader.conn)
+    sightings = get_recent_sightings(downloader.conn, days=7, limit=5)
 
     hardware_feeders = []
     if downloader.feeders_map:
@@ -1613,8 +2069,145 @@ async def handle_api_status(request: web.Request) -> web.Response:
         ),
         "feeders_hardware": hardware_feeders,
         "stats": stats,
+        "sightings": sightings,
     }
     return web.json_response(data)
+
+
+async def handle_api_sightings(request: web.Request) -> web.Response:
+    """Return all recent sightings grouped by sighting_id."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    days = int(request.query.get("days", "7"))
+    limit = int(request.query.get("limit", "0"))
+    sightings = get_recent_sightings(downloader.conn, days=days, limit=limit)
+    return web.json_response({"status": "ok", "sightings": sightings})
+
+
+async def handle_media_view(request: web.Request) -> web.Response:
+    """Serve full-size media file (active or from trash)."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    media_id = request.match_info["media_id"]
+    cursor = downloader.conn.cursor()
+    cursor.execute(
+        "SELECT file_path, is_deleted, trash_path, media_type FROM downloaded_media WHERE media_id = ?",
+        (media_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return web.Response(status=404, text="Media not found")
+
+    file_path, is_deleted, trash_path, media_type = (
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+    )
+    active_path = (
+        trash_path
+        if (is_deleted and trash_path and os.path.exists(trash_path))
+        else file_path
+    )
+
+    if not active_path or not os.path.exists(active_path):
+        return web.Response(status=404, text="Media file not found on disk")
+
+    content_type = (
+        "video/mp4"
+        if media_type == "video" or active_path.endswith(".mp4")
+        else "image/jpeg"
+    )
+    return web.FileResponse(active_path, headers={"Content-Type": content_type})
+
+
+async def handle_media_thumb(request: web.Request) -> web.Response:
+    """Serve downscaled thumbnail for fast dashboard rendering."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    media_id = request.match_info["media_id"]
+    cursor = downloader.conn.cursor()
+    cursor.execute(
+        "SELECT file_path, is_deleted, trash_path, media_type FROM downloaded_media WHERE media_id = ?",
+        (media_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return web.Response(status=404, text="Media not found")
+
+    file_path, is_deleted, trash_path, media_type = (
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+    )
+    active_path = (
+        trash_path
+        if (is_deleted and trash_path and os.path.exists(trash_path))
+        else file_path
+    )
+
+    if not active_path or not os.path.exists(active_path):
+        return web.Response(status=404, text="Media file not found on disk")
+
+    if media_type == "video":
+        return web.FileResponse(active_path, headers={"Content-Type": "video/mp4"})
+
+    try:
+        with Image.open(active_path) as img:
+            img.thumbnail((360, 270), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            buf.seek(0)
+            return web.Response(body=buf.read(), content_type="image/jpeg")
+    except Exception as e:
+        logger.debug(f"Thumbnail generation fallback for {active_path}: {e}")
+        return web.FileResponse(active_path, headers={"Content-Type": "image/jpeg"})
+
+
+async def handle_media_delete(request: web.Request) -> web.Response:
+    """Soft delete media item and move to .trash/."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    try:
+        data = await request.json()
+        media_id = data.get("media_id")
+    except Exception:
+        return web.json_response(
+            {"status": "error", "message": "Invalid JSON"}, status=400
+        )
+
+    if not media_id:
+        return web.json_response(
+            {"status": "error", "message": "media_id required"}, status=400
+        )
+
+    success = soft_delete_media(downloader.conn, downloader.args.download_dir, media_id)
+    if success:
+        return web.json_response({"status": "deleted", "media_id": media_id})
+    return web.json_response(
+        {"status": "error", "message": "Media not found"}, status=404
+    )
+
+
+async def handle_media_restore(request: web.Request) -> web.Response:
+    """Restore soft-deleted media item from .trash/."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    try:
+        data = await request.json()
+        media_id = data.get("media_id")
+    except Exception:
+        return web.json_response(
+            {"status": "error", "message": "Invalid JSON"}, status=400
+        )
+
+    if not media_id:
+        return web.json_response(
+            {"status": "error", "message": "media_id required"}, status=400
+        )
+
+    success = restore_media(downloader.conn, media_id)
+    if success:
+        return web.json_response({"status": "restored", "media_id": media_id})
+    return web.json_response(
+        {"status": "error", "message": "Media not found"}, status=404
+    )
 
 
 async def handle_api_sync(request: web.Request) -> web.Response:
@@ -1634,12 +2227,19 @@ async def handle_api_sync(request: web.Request) -> web.Response:
     )
 
 
-async def create_web_app(downloader: BirdBuddyDownloader) -> web.Application:
+async def create_web_app(
+    downloader: BirdBuddyDownloader,
+) -> web.Application:
     """Create and configure aiohttp web application."""
     app = web.Application()
     app["downloader"] = downloader
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_api_status)
+    app.router.add_get("/api/sightings", handle_api_sightings)
+    app.router.add_get("/api/media/{media_id}/view", handle_media_view)
+    app.router.add_get("/api/media/{media_id}/thumb", handle_media_thumb)
+    app.router.add_post("/api/media/delete", handle_media_delete)
+    app.router.add_post("/api/media/restore", handle_media_restore)
     app.router.add_post("/api/sync", handle_api_sync)
     return app
 
@@ -1752,7 +2352,6 @@ def str_to_float(val: str | None, default: float = 0.0) -> float:
 
 
 def parse_args():
-    # Pre-parse --env-file to load .env before establishing parameter defaults
     env_parser = argparse.ArgumentParser(add_help=False)
     env_parser.add_argument("--env-file", default=os.getenv("ENV_FILE", ".env"))
     known_args, _ = env_parser.parse_known_args()
@@ -1923,7 +2522,6 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start embedded web dashboard server if enabled
     runner = None
     if not args.no_web:
         try:
@@ -1949,7 +2547,6 @@ async def main():
             await downloader.run_once()
             if not downloader.stop_requested:
                 logger.info(f"Done{mode_label}!")
-            # If web dashboard is active, keep running until stopped
             if not args.no_web and not downloader.stop_requested:
                 logger.info(
                     "Web dashboard active. Keeping process alive (Press Ctrl-C to exit)..."
