@@ -2223,9 +2223,15 @@ async def handle_api_status(request: web.Request) -> web.Response:
             downloader.last_sync_time.isoformat() if downloader.last_sync_time else None
         ),
         "last_sync_status": downloader.last_sync_status,
-        "last_sync_downloaded": getattr(downloader, "last_sync_downloaded", 0),
+        "last_sync_downloaded": getattr(
+            downloader,
+            "last_sync_downloaded",
+            getattr(downloader, "last_sync_downloaded_count", 0),
+        ),
         "last_sync_downloaded_count": getattr(
-            downloader, "last_sync_downloaded_count", 0
+            downloader,
+            "last_sync_downloaded_count",
+            getattr(downloader, "last_sync_downloaded", 0),
         ),
         "next_sync_time": (
             downloader.next_sync_time.isoformat() if downloader.next_sync_time else None
