@@ -1840,12 +1840,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
+    let lastRenderedSightingsJson = "";
+
     function renderSightings(sightings) {
       const container = document.getElementById("sightingsContainer");
       if (!sightings || sightings.length === 0) {
-        container.innerHTML = '<div class="empty-state">No sightings recorded in the past week.</div>';
+        if (lastRenderedSightingsJson !== "[]") {
+          container.innerHTML = '<div class="empty-state">No sightings recorded in the past week.</div>';
+          lastRenderedSightingsJson = "[]";
+        }
         return;
       }
+
+      const sightingsJson = JSON.stringify(sightings);
+      if (sightingsJson === lastRenderedSightingsJson) {
+        return; // Data unchanged: preserve existing DOM and prevent thumbnail reloading/flicker
+      }
+      lastRenderedSightingsJson = sightingsJson;
 
       let html = "";
       sightings.forEach(s => {
@@ -1871,7 +1882,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           const isDeleted = m.is_deleted;
           const isSharpest = m.is_sharpest && !isDeleted;
           const sharpScore = m.sharpness_score != null ? m.sharpness_score.toFixed(1) : null;
-          const viewUrl = `/api/media/${encodeURIComponent(m.media_id)}/view`;
           const thumbUrl = `/api/media/${encodeURIComponent(m.media_id)}/thumb`;
 
           let tileClass = "media-tile";
@@ -1880,7 +1890,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
           html += `<div class="${tileClass}" id="tile-${escapeHtml(m.media_id)}">
             <div class="thumb-wrapper" data-media-id="${escapeHtml(m.media_id)}" data-media-type="${escapeHtml(m.media_type)}" data-species="${escapeHtml(s.species_name)}" data-feeder="${escapeHtml(s.feeder_name)}" data-sharpness="${escapeHtml(sharpScore || '')}" data-sharpest="${isSharpest ? 'true' : 'false'}">
-              ${isVid ? `<video class="thumb-img" src="${viewUrl}" preload="metadata"></video><span class="video-badge-icon">▶</span>` : `<img class="thumb-img" src="${thumbUrl}" alt="bird photo" loading="lazy">`}
+              <img class="thumb-img" src="${thumbUrl}" alt="${isVid ? 'video thumbnail' : 'bird photo'}" loading="lazy">
+              ${isVid ? '<span class="video-badge-icon">▶</span>' : ''}
               <div class="tile-overlay-top">
                 <span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${m.media_type.toUpperCase()}</span>
                 ${isSharpest ? `<span class="badge badge-sharpest">⭐ Sharpest</span>` : ''}
@@ -1972,6 +1983,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     async function toggleAllSightings() {
       showingAllSightings = !showingAllSightings;
+      lastRenderedSightingsJson = "";
       const btn = document.getElementById("toggleSightingsBtn");
       const badge = document.getElementById("sightingsCountBadge");
 
@@ -2001,6 +2013,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           });
         }
         if (resp.ok) {
+          lastRenderedSightingsJson = "";
           if (showingAllSightings) {
             await loadAllSightings();
           } else {
@@ -2030,6 +2043,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           });
         }
         if (resp.ok) {
+          lastRenderedSightingsJson = "";
           if (showingAllSightings) {
             await loadAllSightings();
           } else {
@@ -2244,6 +2258,35 @@ async def handle_media_view(request: web.Request) -> web.Response:
     return web.FileResponse(active_path, headers={"Content-Type": content_type})
 
 
+_THUMBNAIL_CACHE: dict[str, bytes] = {}
+
+
+def extract_video_thumbnail(
+    video_path: str, max_size: tuple[int, int] = (360, 270)
+) -> bytes | None:
+    """Extract a downscaled JPEG thumbnail frame from a video file."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+            h, w = frame.shape[:2]
+            scale = min(max_size[0] / w, max_size[1] / h)
+            new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            ret, jpeg_buf = cv2.imencode(
+                ".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 80]
+            )
+            if ret:
+                return jpeg_buf.tobytes()
+        finally:
+            cap.release()
+    except Exception as e:
+        logger.debug(f"Error extracting video thumbnail from {video_path}: {e}")
+    return None
+
+
 async def handle_media_thumb(request: web.Request) -> web.Response:
     """Serve downscaled thumbnail for fast dashboard rendering."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
@@ -2272,19 +2315,54 @@ async def handle_media_thumb(request: web.Request) -> web.Response:
     if not active_path or not os.path.exists(active_path):
         return web.Response(status=404, text="Media file not found on disk")
 
+    try:
+        mtime = os.path.getmtime(active_path)
+        cache_key = f"{media_id}_{mtime}"
+    except Exception:
+        cache_key = media_id
+
+    if cache_key in _THUMBNAIL_CACHE:
+        return web.Response(
+            body=_THUMBNAIL_CACHE[cache_key],
+            content_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     if media_type == "video":
+        thumb_bytes = await asyncio.to_thread(extract_video_thumbnail, active_path)
+        if thumb_bytes:
+            if len(_THUMBNAIL_CACHE) > 500:
+                _THUMBNAIL_CACHE.clear()
+            _THUMBNAIL_CACHE[cache_key] = thumb_bytes
+            return web.Response(
+                body=thumb_bytes,
+                content_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
         return web.FileResponse(active_path, headers={"Content-Type": "video/mp4"})
 
-    try:
-        with Image.open(active_path) as img:
-            img.thumbnail((360, 270), Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=80)
-            buf.seek(0)
-            return web.Response(body=buf.read(), content_type="image/jpeg")
-    except Exception as e:
-        logger.debug(f"Thumbnail generation fallback for {active_path}: {e}")
-        return web.FileResponse(active_path, headers={"Content-Type": "image/jpeg"})
+    def _gen_img_thumb(path: str) -> bytes | None:
+        try:
+            with Image.open(path) as img:
+                img.thumbnail((360, 270), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=80)
+                return buf.getvalue()
+        except Exception as e:
+            logger.debug(f"Thumbnail generation fallback for {path}: {e}")
+            return None
+
+    img_bytes = await asyncio.to_thread(_gen_img_thumb, active_path)
+    if img_bytes:
+        if len(_THUMBNAIL_CACHE) > 500:
+            _THUMBNAIL_CACHE.clear()
+        _THUMBNAIL_CACHE[cache_key] = img_bytes
+        return web.Response(
+            body=img_bytes,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    return web.FileResponse(active_path, headers={"Content-Type": "image/jpeg"})
 
 
 async def handle_media_delete(request: web.Request) -> web.Response:
