@@ -122,7 +122,7 @@ podman run --rm --env-file .env \
 
 A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and publish them to Docker Hub:
 - **`main` Branch**: Tagged with `:latest` on every merge/push to `main`.
-- **Pull Requests**: Tagged with `:pr-<branch_name>` for pull requests originating from source branches within this repository (never built or published for forks).
+- **Pull Requests**: Tagged with `:pr-<branch_name>` and `:pr-<pr_number>` for pull requests originating from source branches within this repository only when the latest PR commit has a `stage` git tag (never built or published for forks).
 - **Release Tags**: Tagged with semantic version tags (e.g. `:v1.0.0`, `:v1.0`).
 
 **Required GitHub Repository Secrets**:

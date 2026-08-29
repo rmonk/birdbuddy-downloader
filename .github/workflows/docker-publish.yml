@@ -12,13 +12,53 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-push:
-    name: Build & Push to Docker Hub
+  check-pr-stage:
+    name: Check PR Stage Tag
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # Only build on push/tags/dispatch OR pull requests from internal repository branches (never forks)
+    # Only evaluate for non-PR events OR PRs originating from internal repository branches (never forks)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+
+    steps:
+      - name: Checkout repository with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
+
+      - name: Verify Stage Tag for PR
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            echo "Checking tags for PR head commit: $HEAD_SHA"
+            TAGS=$(git tag --points-at "$HEAD_SHA")
+            echo "Tags pointing at commit $HEAD_SHA:"
+            echo "$TAGS"
+            if echo "$TAGS" | grep -E -q '^stage($|-|_|\.)'; then
+              echo "PR commit has 'stage' tag. Proceeding with container build."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "PR commit does NOT have a 'stage' tag. Container build skipped."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Event is ${{ github.event_name }}. Proceeding with container build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    name: Build & Push to Docker Hub
+    needs: check-pr-stage
+    if: needs.check-pr-stage.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
