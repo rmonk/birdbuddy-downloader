@@ -1563,6 +1563,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .tile-details { display: flex; justify-content: space-between; color: var(--text-secondary); }
     .tile-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
 
+    /* Pagination */
+    .pagination-wrapper { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .pagination-info { font-size: 0.82rem; color: var(--text-secondary); }
+    .page-indicator { font-size: 0.82rem; color: var(--text-primary); font-weight: 600; padding: 0 4px; }
+    .page-btn { background-color: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); padding: 4px 10px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; transition: all 0.2s; }
+    .page-btn:hover:not(:disabled) { background-color: var(--accent); border-color: var(--accent); color: white; }
+    .page-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .page-size-select { background-color: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); padding: 3px 6px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; outline: none; }
+
     /* Modal Viewer */
     .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(4px); justify-content: center; align-items: center; }
     .modal.active { display: flex; }
@@ -1623,19 +1632,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Sighting Event Downloads Section -->
+    <!-- Sighting Event Downloads Section with Top/Bottom Pagination -->
     <div class="section">
       <div class="section-title">
         <span>📸 Recent Media Downloads (Grouped by Sighting Event)</span>
-        <div style="display: flex; gap: 8px; align-items: center;">
-          <button class="btn btn-secondary" id="toggleSightingsBtn" onclick="toggleAllSightings()" style="padding: 4px 12px; font-size: 0.8rem;">
-            Show All Past 7 Days
-          </button>
-          <span id="sightingsCountBadge" class="pill pill-img">5 Sets</span>
-        </div>
+        <div id="topPagination"></div>
       </div>
       <div id="sightingsContainer">
         <div class="empty-state">Loading recent detection sightings...</div>
+      </div>
+      <div style="display: flex; justify-content: flex-end; margin-top: 14px;">
+        <div id="bottomPagination"></div>
       </div>
     </div>
 
@@ -1828,19 +1835,91 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           document.getElementById("hardwareGrid").innerHTML = hwHtml;
         }
 
-        // 7. Render Sighting Event Groups
-        if (showingAllSightings) {
-          await loadAllSightings();
-        } else {
-          renderSightings(data.sightings || []);
-        }
+        // 7. Render Sighting Event Groups via Pagination
+        await fetchSightings();
 
       } catch (err) {
         console.error("Dashboard error:", err);
       }
     }
 
+    let currentPage = 1;
+    let perPage = 5;
+    let totalSightings = 0;
+    let totalPages = 1;
     let lastRenderedSightingsJson = "";
+
+    function renderPaginationControls() {
+      const topContainer = document.getElementById("topPagination");
+      const bottomContainer = document.getElementById("bottomPagination");
+      if (!topContainer || !bottomContainer) return;
+
+      if (totalSightings === 0) {
+        topContainer.innerHTML = "";
+        bottomContainer.innerHTML = "";
+        return;
+      }
+
+      const startIdx = perPage > 0 ? (currentPage - 1) * perPage + 1 : 1;
+      const endIdx = perPage > 0 ? Math.min(currentPage * perPage, totalSightings) : totalSightings;
+      const infoText = perPage > 0 ? `${startIdx}-${endIdx} of ${totalSightings} sets` : `All ${totalSightings} sets`;
+
+      const prevDisabled = currentPage <= 1 ? "disabled" : "";
+      const nextDisabled = (currentPage >= totalPages || perPage === 0) ? "disabled" : "";
+
+      const html = `
+        <div class="pagination-wrapper">
+          <span class="pagination-info">${infoText}</span>
+          <select class="page-size-select" onchange="changePageSize(Number(this.value))">
+            <option value="5" ${perPage === 5 ? "selected" : ""}>5 / page</option>
+            <option value="10" ${perPage === 10 ? "selected" : ""}>10 / page</option>
+            <option value="20" ${perPage === 20 ? "selected" : ""}>20 / page</option>
+            <option value="0" ${perPage === 0 ? "selected" : ""}>All</option>
+          </select>
+          <button class="page-btn" ${prevDisabled} onclick="goToPage(${currentPage - 1})">‹ Prev</button>
+          <span class="page-indicator">Page ${currentPage} / ${totalPages}</span>
+          <button class="page-btn" ${nextDisabled} onclick="goToPage(${currentPage + 1})">Next ›</button>
+        </div>
+      `;
+
+      topContainer.innerHTML = html;
+      bottomContainer.innerHTML = html;
+    }
+
+    async function goToPage(page) {
+      if (page < 1 || (totalPages > 0 && page > totalPages)) return;
+      currentPage = page;
+      lastRenderedSightingsJson = "";
+      await fetchSightings();
+    }
+
+    async function changePageSize(size) {
+      perPage = size;
+      currentPage = 1;
+      lastRenderedSightingsJson = "";
+      await fetchSightings();
+    }
+
+    async function fetchSightings() {
+      try {
+        const url = `/api/sightings?days=7&page=${currentPage}&per_page=${perPage}`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error("HTTP error " + resp.status);
+        const data = await resp.json();
+
+        if (data.pagination) {
+          totalSightings = data.pagination.total_sightings;
+          currentPage = data.pagination.page;
+          totalPages = data.pagination.total_pages;
+          perPage = data.pagination.per_page;
+        }
+
+        renderSightings(data.sightings || []);
+        renderPaginationControls();
+      } catch (e) {
+        console.error("Error fetching sightings:", e);
+      }
+    }
 
     function renderSightings(sightings) {
       const container = document.getElementById("sightingsContainer");
@@ -1854,7 +1933,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       const sightingsJson = JSON.stringify(sightings);
       if (sightingsJson === lastRenderedSightingsJson) {
-        return; // Data unchanged: preserve existing DOM and prevent thumbnail reloading/flicker
+        return;
       }
       lastRenderedSightingsJson = sightingsJson;
 
@@ -1920,7 +1999,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
       container.innerHTML = html;
 
-      // Attach safe event listeners without inline JS evaluation
       container.querySelectorAll('.thumb-wrapper').forEach(el => {
         el.addEventListener('click', () => {
           openModal(
@@ -1971,33 +2049,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       return false;
     }
 
-    async function loadAllSightings() {
-      try {
-        const resp = await fetch("/api/sightings?limit=0&days=7");
-        const data = await resp.json();
-        renderSightings(data.sightings || []);
-      } catch (e) {
-        console.error("Error fetching all sightings:", e);
-      }
-    }
-
-    async function toggleAllSightings() {
-      showingAllSightings = !showingAllSightings;
-      lastRenderedSightingsJson = "";
-      const btn = document.getElementById("toggleSightingsBtn");
-      const badge = document.getElementById("sightingsCountBadge");
-
-      if (showingAllSightings) {
-        btn.innerText = "Show Recent 5 Sets";
-        badge.innerText = "All (7 Days)";
-        await loadAllSightings();
-      } else {
-        btn.innerText = "Show All Past 7 Days";
-        badge.innerText = "5 Sets";
-        await loadStatus();
-      }
-    }
-
     async function deleteMedia(mediaId) {
       try {
         let resp = await fetch("/api/media/delete", {
@@ -2014,11 +2065,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
         if (resp.ok) {
           lastRenderedSightingsJson = "";
-          if (showingAllSightings) {
-            await loadAllSightings();
-          } else {
-            await loadStatus();
-          }
+          await fetchSightings();
+          await loadStatus();
         } else {
           const err = await resp.json();
           alert("Error deleting media: " + (err.message || resp.statusText));
@@ -2044,11 +2092,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
         if (resp.ok) {
           lastRenderedSightingsJson = "";
-          if (showingAllSightings) {
-            await loadAllSightings();
-          } else {
-            await loadStatus();
-          }
+          await fetchSightings();
+          await loadStatus();
         } else {
           const err = await resp.json();
           alert("Error restoring media: " + (err.message || resp.statusText));
@@ -2165,19 +2210,18 @@ async def handle_api_status(request: web.Request) -> web.Response:
                         "state": signal_info.get("state"),
                         "value_dbm": signal_info.get("value"),
                     },
-                    "temperature": temp.get("value"),
+                    "temperature": temp.get("value") if temp else None,
                 }
             )
 
     data = {
-        "status": "ok",
         "is_syncing": downloader.is_syncing,
         "interval_seconds": downloader.args.interval,
         "last_sync_time": (
             downloader.last_sync_time.isoformat() if downloader.last_sync_time else None
         ),
         "last_sync_status": downloader.last_sync_status,
-        "last_sync_downloaded": downloader.last_sync_downloaded,
+        "last_sync_downloaded_count": downloader.last_sync_downloaded_count,
         "next_sync_time": (
             downloader.next_sync_time.isoformat() if downloader.next_sync_time else None
         ),
@@ -2208,18 +2252,47 @@ def check_api_auth(request: web.Request, downloader: BirdBuddyDownloader) -> boo
 
 
 async def handle_api_sightings(request: web.Request) -> web.Response:
-    """Return all recent sightings grouped by sighting_id."""
+    """Return recent sightings grouped by sighting_id with pagination."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
     try:
         days = max(1, int(request.query.get("days", "7")))
-        limit = max(0, int(request.query.get("limit", "0")))
+        page = max(1, int(request.query.get("page", "1")))
+        per_page_param = request.query.get("per_page") or request.query.get(
+            "limit", "5"
+        )
+        per_page = max(0, int(per_page_param))
     except ValueError:
         return web.json_response(
-            {"status": "error", "message": "days and limit must be integers"},
+            {"status": "error", "message": "Query parameters must be integers"},
             status=400,
         )
-    sightings = get_recent_sightings(downloader.conn, days=days, limit=limit)
-    return web.json_response({"status": "ok", "sightings": sightings})
+
+    all_sightings = get_recent_sightings(downloader.conn, days=days, limit=0)
+    total_sightings = len(all_sightings)
+
+    if per_page > 0:
+        total_pages = max(1, (total_sightings + per_page - 1) // per_page)
+        effective_page = min(page, total_pages)
+        offset = (effective_page - 1) * per_page
+        paged_sightings = all_sightings[offset : offset + per_page]
+    else:
+        total_pages = 1
+        effective_page = 1
+        per_page = total_sightings
+        paged_sightings = all_sightings
+
+    return web.json_response(
+        {
+            "status": "ok",
+            "sightings": paged_sightings,
+            "pagination": {
+                "total_sightings": total_sightings,
+                "page": effective_page,
+                "per_page": per_page,
+                "total_pages": total_pages,
+            },
+        }
+    )
 
 
 async def handle_media_view(request: web.Request) -> web.Response:
