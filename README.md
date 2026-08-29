@@ -31,8 +31,13 @@ An automated python utility to download images and videos from all Bird Buddy ca
 - **Flexible Execution**:
   - **Single-run mode**: Ideal for running via `cron` or `systemd` timers.
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
-- **Web Status Dashboard**:
+- **Web Status Dashboard & Sighting Gallery**:
   - Embedded real-time web dashboard running on port `8080` (configurable via `--web-port` / `WEB_PORT`).
+  - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (showing the 5 most recent sets by default with an expandable toggle for all 7-day events).
+  - **OpenCV Image Sharpness Rating**: Evaluates image sharpness using the variance of Laplacian method (`cv2.Laplacian`), caching the rating in SQLite while the media record is retained and highlighting the **"⭐ Sharpest"** image in each sighting group.
+  - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails.
+  - **Soft Delete & Temporary Trash Storage**: Move unwanted files to a `.trash/` directory directly from the UI with a `🗑️ Delete` button. Deleted files remain visible with a `[Removed]` badge and can be reverted with `↩️ Restore`.
+  - **Automated Trash Purging**: Files in `.trash/` are permanently removed from disk when their database record ages out (`--db-retention-days 14`), while active downloads are preserved.
   - Displays sync interval, last sync execution time/status, next scheduled sync countdown, and connected feeder hardware status.
   - Shows breakdown table of photos and videos downloaded over the **past hour**, **past day (24 hours)**, and **past week (7 days)** per camera feeder and overall totals.
   - Provides a "Sync Now" button to trigger immediate on-demand syncing.
@@ -115,7 +120,10 @@ podman run --rm --env-file .env \
 
 ### 4. Automated Container Builds (GitHub Actions)
 
-A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and push them to `docker.io/moosemouse/birdbuddy-downloader:latest` on every push to `main` or new version tag.
+A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and publish them to Docker Hub:
+- **`main` Branch**: Tagged with `:latest` on every merge/push to `main`.
+- **Pull Requests**: Tagged with `:pr-<branch_name>` and `:pr-<pr_number>` for pull requests originating from source branches within this repository only when the latest PR commit has a `stage` git tag (never built or published for forks).
+- **Release Tags**: Tagged with semantic version tags (e.g. `:v1.0.0`, `:v1.0`).
 
 **Required GitHub Repository Secrets**:
 - `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).
