@@ -6,11 +6,14 @@ on:
       - main
     tags:
       - 'v*.*.*'
-      - 'stage*'
   pull_request:
     branches:
       - main
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check-pr-stage:
@@ -86,7 +89,6 @@ jobs:
             type=raw,value=latest,enable=${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
             type=raw,value=pr-${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
             type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
-            type=raw,value=stage,enable=${{ github.ref == 'refs/tags/stage' }}
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
