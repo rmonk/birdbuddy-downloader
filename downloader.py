@@ -168,6 +168,9 @@ def get_bird_detector_net(model_path: str | None = None):
         candidate_paths.append(env_path)
     candidate_paths.extend(
         [
+            "/app/models/yolo26n.onnx",
+            "models/yolo26n.onnx",
+            os.path.join(os.path.dirname(__file__), "models", "yolo26n.onnx"),
             "/app/models/yolov8n.onnx",
             "models/yolov8n.onnx",
             os.path.join(os.path.dirname(__file__), "models", "yolov8n.onnx"),
@@ -2923,8 +2926,8 @@ def parse_args():
     )
     parser.add_argument(
         "--model-path",
-        default=os.getenv("BIRD_MODEL_PATH", "models/yolov8n.onnx"),
-        help="Path to ONNX object detection model for bird identification (default: models/yolov8n.onnx or BIRD_MODEL_PATH env var)",
+        default=os.getenv("BIRD_MODEL_PATH", "models/yolo26n.onnx"),
+        help="Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)",
     )
     parser.add_argument(
         "--no-detect",

@@ -2,7 +2,7 @@
 FROM python:3.11-slim AS model-builder
 WORKDIR /build
 RUN pip install --no-cache-dir ultralytics && \
-    python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx', imgsz=640, opset=12)"
+    python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12)"
 
 # Stage 2: Final runtime container image
 FROM python:3.11-slim
@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy bundled YOLO nano ONNX model from builder stage
 RUN mkdir -p /app/models
-COPY --from=model-builder /build/yolov8n.onnx /app/models/yolov8n.onnx
+COPY --from=model-builder /build/yolo26n.onnx /app/models/yolo26n.onnx
 
 # Copy downloader application script
 COPY downloader.py .

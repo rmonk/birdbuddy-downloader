@@ -125,7 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 | `--buffer-hours` | `2.0` | Hours before latest downloaded detection to start fetching feed items |
 | `--db-retention-days` | `14` | Days to retain records in database before cleanup (0 to disable) |
 | `--min-bird-confidence` | `0.25` | Minimum detection confidence threshold to count as a bird match |
-| `--model-path` | `models/yolov8n.onnx` | Path to ONNX object detection model for bird identification |
+| `--model-path` | `models/yolo26n.onnx` | Path to ONNX object detection model for bird identification |
 | `--no-detect` | `False` | Skip bird detection likelihood scoring on downloaded images |
 | `--full-sync` | `False` | Bypass incremental cutoff and perform a full feed sync |
 | `--interval` | `0` | Polling interval in seconds (0 = single run) |
