@@ -232,8 +232,7 @@ def detect_birds(
             bird_scores = output[0, 18, :]
             max_score = float(np.max(bird_scores))
             bird_count = int(np.sum(bird_scores >= min_confidence))
-            score = round(max_score, 2)
-            return score, bird_count
+            return max_score, bird_count
         return None, 0
     except Exception as e:
         logger.debug(f"Error during bird detection on {image_path}: {e}")
