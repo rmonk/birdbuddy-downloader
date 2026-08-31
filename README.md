@@ -70,7 +70,17 @@ Install all required packages from `requirements.txt`:
 pip install -r requirements.txt
 ```
 
-### 4. Configure Credentials & Options
+### 4. (Optional) Provision Bird Detection Model
+When running locally outside of the container, export or place the YOLO nano ONNX model in `models/yolo26n.onnx`:
+```bash
+# Export yolo26n.onnx using ultralytics (one-time setup)
+pip install ultralytics
+python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12)"
+mkdir -p models && mv yolo26n.onnx models/yolo26n.onnx
+```
+*Note: In container deployments, the model is automatically bundled during the build. If running locally without a model, you can provide a custom path via `--model-path` / `BIRD_MODEL_PATH` or disable detection using `--no-detect`.*
+
+### 5. Configure Credentials & Options
 Edit the `.env` file with your Bird Buddy account email and password (and optional configuration):
 ```env
 USERNAME="your_email@example.com"
@@ -79,6 +89,8 @@ PASSWORD="your_password"
 # Optional settings
 # BUFFER_HOURS=2.0
 # DB_RETENTION_DAYS=14
+# MIN_BIRD_CONFIDENCE=0.25
+# BIRD_MODEL_PATH="models/yolo26n.onnx"
 # DIR_TEMPLATE="{feeder_name}/{species_name}/{date}_{detection_id_short}"
 # FILENAME_TEMPLATE="{detection_id_short}_{id_short}.{ext}"
 ```
@@ -219,7 +231,10 @@ usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME] [--passwor
                      [--buffer-hours BUFFER_HOURS] [--db-retention-days DB_RETENTION_DAYS]
                      [--full-sync] [--interval INTERVAL] [--max-pages MAX_PAGES]
                      [--no-images] [--no-videos] [--feeder-filter FEEDER_FILTER] [--dry-run]
-                     [--info] [--json] [-v]
+                     [--info] [--json] [--web-port WEB_PORT] [--web-host WEB_HOST]
+                     [--web-api-key WEB_API_KEY] [--no-web]
+                     [--min-bird-confidence MIN_BIRD_CONFIDENCE] [--model-path MODEL_PATH]
+                     [--no-detect] [-v]
 
 Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, and feeder info.
 
@@ -251,7 +266,14 @@ options:
   --json                Output --info as raw JSON
   --web-port WEB_PORT   Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)
   --web-host WEB_HOST   Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)
+  --web-api-key WEB_API_KEY
+                        Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)
   --no-web              Disable embedded web status dashboard
+  --min-bird-confidence MIN_BIRD_CONFIDENCE
+                        Minimum detection confidence threshold to count as a bird match (default: 0.25)
+  --model-path MODEL_PATH
+                        Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx)
+  --no-detect           Skip bird detection likelihood scoring on downloaded images
   -v, --verbose         Enable debug logging
 ```
 
