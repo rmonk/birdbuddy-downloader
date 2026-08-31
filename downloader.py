@@ -247,6 +247,36 @@ def is_media_downloaded(conn: sqlite3.Connection, media_id: str) -> bool:
     return cursor.fetchone() is not None
 
 
+def get_media_bird_score(
+    conn: sqlite3.Connection, media_id: str
+) -> tuple[bool, float | None]:
+    """Check if media is in database and if it has a bird_score populated.
+    Returns (is_in_db, bird_score).
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT bird_score FROM downloaded_media WHERE media_id = ?", (media_id,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False, None
+    return True, row[0]
+
+
+def update_media_bird_score(
+    conn: sqlite3.Connection,
+    media_id: str,
+    bird_score: float | None,
+    bird_detected: int,
+):
+    """Update bird detection score on an existing downloaded media record."""
+    with conn:
+        conn.execute(
+            "UPDATE downloaded_media SET bird_score = ?, bird_detected = ? WHERE media_id = ?",
+            (bird_score, bird_detected, media_id),
+        )
+
+
 def record_media_downloaded(
     conn: sqlite3.Connection,
     media_id: str,
@@ -1006,42 +1036,50 @@ class BirdBuddyDownloader:
             template_vars=t_vars,
         )
 
-        already_downloaded = is_media_downloaded(self.conn, media_id) or os.path.exists(
-            dest_path
-        )
+        is_in_db, existing_bird_score = get_media_bird_score(self.conn, media_id)
+        file_exists = os.path.exists(dest_path)
+        already_downloaded = is_in_db or file_exists
 
         if already_downloaded:
             if (
-                not is_media_downloaded(self.conn, media_id)
-                and os.path.exists(dest_path)
+                file_exists
+                and media_type == "image"
+                and not getattr(self.args, "no_detect", False)
                 and not self.args.dry_run
             ):
-                bird_score, bird_detected = (
-                    await asyncio.to_thread(
+                if not is_in_db:
+                    bird_score, bird_detected = await asyncio.to_thread(
                         detect_birds,
                         dest_path,
                         getattr(self.args, "min_bird_confidence", 0.25),
                         getattr(self.args, "model_path", None),
                     )
-                    if (
-                        media_type == "image"
-                        and not getattr(self.args, "no_detect", False)
+                    record_media_downloaded(
+                        self.conn,
+                        media_id,
+                        feeder_id,
+                        feeder_name,
+                        species_name,
+                        media_type,
+                        created_at_str,
+                        dest_path,
+                        sighting_id=sighting_id or postcard_id,
+                        bird_score=bird_score,
+                        bird_detected=bird_detected,
                     )
-                    else (None, 0)
-                )
-                record_media_downloaded(
-                    self.conn,
-                    media_id,
-                    feeder_id,
-                    feeder_name,
-                    species_name,
-                    media_type,
-                    created_at_str,
-                    dest_path,
-                    sighting_id=sighting_id or postcard_id,
-                    bird_score=bird_score,
-                    bird_detected=bird_detected,
-                )
+                elif existing_bird_score is None:
+                    bird_score, bird_detected = await asyncio.to_thread(
+                        detect_birds,
+                        dest_path,
+                        getattr(self.args, "min_bird_confidence", 0.25),
+                        getattr(self.args, "model_path", None),
+                    )
+                    update_media_bird_score(
+                        self.conn, media_id, bird_score, bird_detected
+                    )
+                    logger.debug(
+                        f"Backfilled bird detection score for existing media {media_id}: {bird_score}"
+                    )
             logger.debug(f"Media {media_id} already downloaded. Skipping.")
             return "skipped"
 
