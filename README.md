@@ -33,9 +33,10 @@ An automated python utility to download images and videos from all Bird Buddy ca
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
 - **Web Status Dashboard & Sighting Gallery**:
   - Embedded real-time web dashboard running on port `8080` (configurable via `--web-port` / `WEB_PORT`).
-  - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (showing the 5 most recent sets by default with an expandable toggle for all 7-day events).
-  - **OpenCV Image Sharpness Rating**: Evaluates image sharpness using the variance of Laplacian method (`cv2.Laplacian`), caching the rating in SQLite while the media record is retained and highlighting the **"⭐ Sharpest"** image in each sighting group.
-  - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails.
+  - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (with synchronized pagination controls at the top right and bottom right of the section).
+  - **Automated Bird Identification & Likelihood Scoring**: Evaluates image bird presence and confidence via OpenCV DNN using a bundled lightweight YOLO object detection model.
+  - **"Best View" Highlighting**: Automatically tags and highlights the image with the highest bird likelihood within each sighting group with a **"Best View"** badge and gold border.
+  - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails, including bird likelihood percentages.
   - **Soft Delete & Temporary Trash Storage**: Move unwanted files to a `.trash/` directory directly from the UI with a `🗑️ Delete` button. Deleted files remain visible with a `[Removed]` badge and can be reverted with `↩️ Restore`.
   - **Automated Trash Purging**: Files in `.trash/` are permanently removed from disk when their database record ages out (`--db-retention-days 14`), while active downloads are preserved.
   - Displays sync interval, last sync execution time/status, next scheduled sync countdown, and connected feeder hardware status.

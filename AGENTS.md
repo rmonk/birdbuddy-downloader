@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     downloaded_at TEXT,
     file_path TEXT,
     sighting_id TEXT,
+    bird_score REAL,
+    bird_detected INTEGER DEFAULT 0,
     sharpness_score REAL,
     is_deleted INTEGER DEFAULT 0,
     trash_path TEXT,
@@ -89,13 +91,14 @@ CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
 CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
 CREATE INDEX IF NOT EXISTS idx_created_at ON downloaded_media(created_at);
 CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id);
+CREATE INDEX IF NOT EXISTS idx_bird_score ON downloaded_media(bird_score);
 CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 ```
 
 ### Key Functions & Classes
 - `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, state tracking, and media downloading.
-- `calculate_image_sharpness()`: Computes variance of Laplacian on grayscale image data (`cv2.Laplacian(gray, cv2.CV_64F).var()`).
-- `get_recent_sightings()`: Queries media from the past 7 days grouped by `sighting_id`, tagging the sharpest photo per sighting and tracking active vs removed items.
+- `detect_birds()`: Analyzes downloaded images via OpenCV DNN (`cv2.dnn`) with a lightweight ONNX YOLO object detector to calculate bird presence likelihood and confidence score.
+- `get_recent_sightings()`: Queries media from the past 7 days grouped by `sighting_id`, tagging the highest bird likelihood photo (`is_best_view = True`) per sighting and tracking active vs removed items.
 - `soft_delete_media()` / `restore_media()`: Safely moves deleted files to `.trash/` or restores them to original path.
 - `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days); permanently removes aged `.trash/` files from disk while preserving active files.
 - `get_feeder_download_stats()`: Queries SQLite for per-feeder download breakdown (past hour, 24 hours, 7 days, all-time totals, and recent activity).
@@ -121,6 +124,9 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 | `--filename-template` | `{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}` | Output filename template |
 | `--buffer-hours` | `2.0` | Hours before latest downloaded detection to start fetching feed items |
 | `--db-retention-days` | `14` | Days to retain records in database before cleanup (0 to disable) |
+| `--min-bird-confidence` | `0.25` | Minimum detection confidence threshold to count as a bird match |
+| `--model-path` | `models/yolov8n.onnx` | Path to ONNX object detection model for bird identification |
+| `--no-detect` | `False` | Skip bird detection likelihood scoring on downloaded images |
 | `--full-sync` | `False` | Bypass incremental cutoff and perform a full feed sync |
 | `--interval` | `0` | Polling interval in seconds (0 = single run) |
 | `--max-pages` | `0` | Max feed pages to fetch (0 = unlimited) |
@@ -132,6 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 | `--json` | `False` | Output `--info` as raw JSON |
 | `--web-port` | `8080` | Port for embedded web status dashboard (or `WEB_PORT` env var) |
 | `--web-host` | `0.0.0.0` | Host to bind embedded web dashboard (or `WEB_HOST` env var) |
+| `--web-api-key` | `None` | Optional API key secret to protect mutating endpoints |
 | `--no-web` | `False` | Disable embedded web status dashboard |
 | `-v`, `--verbose` | `False` | Enable debug logging |
 

@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     downloaded_at TEXT,
     file_path TEXT,
     sighting_id TEXT,
+    bird_score REAL,
+    bird_detected INTEGER DEFAULT 0,
     sharpness_score REAL,
     is_deleted INTEGER DEFAULT 0,
     trash_path TEXT,
@@ -101,6 +103,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
         cursor.execute("PRAGMA table_info(downloaded_media)")
         existing_cols = {row[1] for row in cursor.fetchall()}
 
+        if "bird_score" not in existing_cols:
+            cursor.execute("ALTER TABLE downloaded_media ADD COLUMN bird_score REAL")
+        if "bird_detected" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE downloaded_media ADD COLUMN bird_detected INTEGER DEFAULT 0"
+            )
         if "sighting_id" not in existing_cols:
             cursor.execute("ALTER TABLE downloaded_media ADD COLUMN sighting_id TEXT")
         if "sharpness_score" not in existing_cols:
@@ -130,29 +138,103 @@ def init_db(db_path: str) -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_sighting_id ON downloaded_media(sighting_id)"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bird_score ON downloaded_media(bird_score)"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted)"
         )
 
     return conn
 
 
-def calculate_image_sharpness(image_path: str) -> float | None:
-    """Calculate image sharpness score using the variance of Laplacian method (higher = sharper)."""
-    if not image_path or not os.path.exists(image_path):
+_BIRD_NET = None
+_BIRD_NET_TRIED = False
+
+
+def get_bird_detector_net(model_path: str | None = None):
+    """Load and cache the ONNX object detection model for bird identification."""
+    global _BIRD_NET, _BIRD_NET_TRIED
+    if _BIRD_NET is not None:
+        return _BIRD_NET
+    if _BIRD_NET_TRIED:
         return None
+
+    _BIRD_NET_TRIED = True
+    candidate_paths = []
+    if model_path:
+        candidate_paths.append(model_path)
+    env_path = os.getenv("BIRD_MODEL_PATH")
+    if env_path:
+        candidate_paths.append(env_path)
+    candidate_paths.extend(
+        [
+            "/app/models/yolov8n.onnx",
+            "models/yolov8n.onnx",
+            os.path.join(os.path.dirname(__file__), "models", "yolov8n.onnx"),
+        ]
+    )
+
+    for path in candidate_paths:
+        if path and os.path.exists(path):
+            try:
+                net = cv2.dnn.readNetFromONNX(path)
+                net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                _BIRD_NET = net
+                logger.info(f"Loaded bird detection model from {path}")
+                return _BIRD_NET
+            except Exception as e:
+                logger.warning(f"Failed to load ONNX model from {path}: {e}")
+
+    logger.debug("No bird detection model found; bird likelihood scoring disabled.")
+    return None
+
+
+def detect_birds(
+    image_path: str,
+    min_confidence: float = 0.25,
+    model_path: str | None = None,
+) -> tuple[float | None, int]:
+    """
+    Analyze image using YOLO ONNX object detection to calculate bird likelihood.
+    Returns (max_bird_confidence, detected_bird_count).
+    """
+    if not image_path or not os.path.exists(image_path):
+        return None, 0
+
+    net = get_bird_detector_net(model_path)
+    if net is None:
+        return None, 0
+
     try:
         with open(image_path, "rb") as f:
             img_bytes = f.read()
         np_arr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if img is None:
-            return None
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return round(float(lap_var), 2)
+            return None, 0
+
+        # Preprocess image for YOLO (640x640, BGR->RGB, scale 1/255.0)
+        blob = cv2.dnn.blobFromImage(
+            img, 1.0 / 255.0, (640, 640), swapRB=True, crop=False
+        )
+        net.setInput(blob)
+        output = net.forward()
+
+        # YOLOv8 output shape: [1, 84, 8400]
+        # In COCO dataset, class index 14 is 'bird'
+        # In YOLOv8 output matrix, rows 0-3 are bbox coords (x,y,w,h) and rows 4-83 are class scores
+        # Row for bird class (id 14) is 4 + 14 = 18
+        if len(output.shape) == 3 and output.shape[1] >= 19:
+            bird_scores = output[0, 18, :]
+            max_score = float(np.max(bird_scores))
+            bird_count = int(np.sum(bird_scores >= min_confidence))
+            score = round(max_score, 2)
+            return score, bird_count
+        return None, 0
     except Exception as e:
-        logger.debug(f"Failed to calculate sharpness for {image_path}: {e}")
-        return None
+        logger.debug(f"Error during bird detection on {image_path}: {e}")
+        return None, 0
 
 
 def is_media_downloaded(conn: sqlite3.Connection, media_id: str) -> bool:
@@ -172,6 +254,8 @@ def record_media_downloaded(
     created_at: str,
     file_path: str,
     sighting_id: str | None = None,
+    bird_score: float | None = None,
+    bird_detected: int = 0,
     sharpness_score: float | None = None,
 ):
     """Record media item in database after successful download."""
@@ -179,9 +263,9 @@ def record_media_downloaded(
     with conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO downloaded_media
-            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path, sighting_id, sharpness_score, is_deleted, trash_path, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+            INSERT OR REPLACE INTO downloaded_media 
+            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path, sighting_id, bird_score, bird_detected, sharpness_score, is_deleted, trash_path, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
             """,
             (
                 media_id,
@@ -193,6 +277,8 @@ def record_media_downloaded(
                 now_iso,
                 file_path,
                 sighting_id,
+                bird_score,
+                bird_detected,
                 sharpness_score,
             ),
         )
@@ -442,11 +528,14 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
 
 
 def get_recent_sightings(
-    conn: sqlite3.Connection, days: int = 7, limit: int = 0
+    conn: sqlite3.Connection,
+    days: int = 7,
+    limit: int = 0,
+    min_bird_confidence: float = 0.25,
 ) -> list[dict]:
     """
     Query media from the past `days` grouped by sighting_id.
-    Identifies the sharpest image per sighting and includes both active and removed items.
+    Identifies the image with the highest bird likelihood per sighting and includes both active and removed items.
     """
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=days)).isoformat()
@@ -462,6 +551,8 @@ def get_recent_sightings(
         created_at,
         downloaded_at,
         file_path,
+        bird_score,
+        bird_detected,
         sharpness_score,
         is_deleted,
         trash_path
@@ -482,9 +573,11 @@ def get_recent_sightings(
         c_at = row[5]
         dl_at = row[6]
         fpath = row[7]
-        sharpness = row[8]
-        is_del = bool(row[9])
-        tpath = row[10]
+        b_score = row[8]
+        b_det = bool(row[9])
+        sharpness = row[10]
+        is_del = bool(row[11])
+        tpath = row[12]
 
         if s_id not in sightings_dict:
             sightings_dict[s_id] = {
@@ -504,6 +597,8 @@ def get_recent_sightings(
             "created_at": c_at,
             "downloaded_at": dl_at,
             "file_path": fpath,
+            "bird_score": b_score,
+            "bird_detected": b_det,
             "sharpness_score": sharpness,
             "is_deleted": is_del,
             "trash_path": tpath,
@@ -512,7 +607,7 @@ def get_recent_sightings(
                 if fpath
                 else f"{m_id}.{('jpg' if mtype == 'image' else 'mp4')}"
             ),
-            "is_sharpest": False,
+            "is_best_view": False,
         }
 
         if mtype == "video":
@@ -523,16 +618,21 @@ def get_recent_sightings(
 
     sightings_list = list(sightings_dict.values())
 
-    # For each sighting, identify the sharpest image
+    # For each sighting, identify the image with the highest bird likelihood
     for s in sightings_list:
         images = s["images"]
         if images:
-            valid_images = [img for img in images if img["sharpness_score"] is not None]
+            valid_images = [img for img in images if img.get("bird_score") is not None]
             if valid_images:
                 active_images = [img for img in valid_images if not img["is_deleted"]]
                 pool = active_images if active_images else valid_images
-                max_img = max(pool, key=lambda x: x["sharpness_score"])
-                max_img["is_sharpest"] = True
+                max_img = max(pool, key=lambda x: x.get("bird_score") or 0.0)
+                if (max_img.get("bird_score") or 0.0) >= min_bird_confidence:
+                    max_img["is_best_view"] = True
+            else:
+                active_images = [img for img in images if not img["is_deleted"]]
+                pool = active_images if active_images else images
+                pool[0]["is_best_view"] = True
 
     if limit > 0:
         return sightings_list[:limit]
@@ -913,10 +1013,18 @@ class BirdBuddyDownloader:
                 and os.path.exists(dest_path)
                 and not self.args.dry_run
             ):
-                sharpness = (
-                    await asyncio.to_thread(calculate_image_sharpness, dest_path)
-                    if media_type == "image"
-                    else None
+                bird_score, bird_detected = (
+                    await asyncio.to_thread(
+                        detect_birds,
+                        dest_path,
+                        getattr(self.args, "min_bird_confidence", 0.25),
+                        getattr(self.args, "model_path", None),
+                    )
+                    if (
+                        media_type == "image"
+                        and not getattr(self.args, "no_detect", False)
+                    )
+                    else (None, 0)
                 )
                 record_media_downloaded(
                     self.conn,
@@ -928,7 +1036,8 @@ class BirdBuddyDownloader:
                     created_at_str,
                     dest_path,
                     sighting_id=sighting_id or postcard_id,
-                    sharpness_score=sharpness,
+                    bird_score=bird_score,
+                    bird_detected=bird_detected,
                 )
             logger.debug(f"Media {media_id} already downloaded. Skipping.")
             return "skipped"
@@ -952,10 +1061,17 @@ class BirdBuddyDownloader:
                 apply_timestamps_and_exif(
                     dest_path, dt, is_image=(media_type == "image")
                 )
-            sharpness = (
-                await asyncio.to_thread(calculate_image_sharpness, dest_path)
-                if media_type == "image"
-                else None
+            bird_score, bird_detected = (
+                await asyncio.to_thread(
+                    detect_birds,
+                    dest_path,
+                    getattr(self.args, "min_bird_confidence", 0.25),
+                    getattr(self.args, "model_path", None),
+                )
+                if (
+                    media_type == "image" and not getattr(self.args, "no_detect", False)
+                )
+                else (None, 0)
             )
             record_media_downloaded(
                 self.conn,
@@ -967,11 +1083,16 @@ class BirdBuddyDownloader:
                 created_at_str,
                 dest_path,
                 sighting_id=sighting_id or postcard_id,
-                sharpness_score=sharpness,
+                bird_score=bird_score,
+                bird_detected=bird_detected,
             )
-            sharp_str = f" (Sharpness: {sharpness})" if sharpness else ""
+            score_str = (
+                f" (Bird Likelihood: {int(bird_score * 100)}%)"
+                if bird_score is not None
+                else ""
+            )
             logger.info(
-                f"Successfully downloaded and timestamped: {dest_path}{sharp_str}"
+                f"Successfully downloaded and timestamped: {dest_path}{score_str}"
             )
             return "downloaded"
         return "filtered"
@@ -1522,7 +1643,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .badge-syncing { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); animation: pulse 1.5s infinite; }
     .badge-error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     .badge-idle { background: rgba(148, 163, 184, 0.2); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.4); }
-    .badge-sharpest { background: var(--gold-bg); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.5); font-weight: 700; }
+    .badge-best-view { background: var(--gold-bg); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.5); font-weight: 700; }
     .badge-removed { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
@@ -1555,7 +1676,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .media-tile { background: var(--bg-secondary); border-radius: 6px; border: 1px solid var(--border); overflow: hidden; display: flex; flex-direction: column; position: relative; transition: transform 0.2s, box-shadow 0.2s; }
     .media-tile:hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.25); }
     .media-tile.deleted { opacity: 0.55; border-color: rgba(239, 68, 68, 0.5); filter: grayscale(40%); }
-    .media-tile.sharpest-tile { border: 2px solid var(--gold); }
+    .media-tile.best-view-tile { border: 2px solid var(--gold); }
     .thumb-wrapper { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; cursor: pointer; overflow: hidden; }
     .thumb-img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.3s; }
     .thumb-wrapper:hover .thumb-img { transform: scale(1.04); }
@@ -1961,27 +2082,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         mediaItems.forEach(m => {
           const isVid = m.media_type === "video";
           const isDeleted = m.is_deleted;
-          const isSharpest = m.is_sharpest && !isDeleted;
-          const sharpScore = m.sharpness_score != null ? m.sharpness_score.toFixed(1) : null;
+          const isBestView = m.is_best_view && !isDeleted;
+          const birdScore = m.bird_score != null ? Math.round(m.bird_score * 100) : null;
           const thumbUrl = `/api/media/${encodeURIComponent(m.media_id)}/thumb`;
 
           let tileClass = "media-tile";
           if (isDeleted) tileClass += " deleted";
-          if (isSharpest) tileClass += " sharpest-tile";
+          if (isBestView) tileClass += " best-view-tile";
 
           html += `<div class="${tileClass}" id="tile-${escapeHtml(m.media_id)}">
-            <div class="thumb-wrapper" data-media-id="${escapeHtml(m.media_id)}" data-media-type="${escapeHtml(m.media_type)}" data-species="${escapeHtml(s.species_name)}" data-feeder="${escapeHtml(s.feeder_name)}" data-sharpness="${escapeHtml(sharpScore || '')}" data-sharpest="${isSharpest ? 'true' : 'false'}">
+            <div class="thumb-wrapper" data-media-id="${escapeHtml(m.media_id)}" data-media-type="${escapeHtml(m.media_type)}" data-species="${escapeHtml(s.species_name)}" data-feeder="${escapeHtml(s.feeder_name)}" data-bird-score="${escapeHtml(birdScore != null ? birdScore : '')}" data-best-view="${isBestView ? 'true' : 'false'}">
               <img class="thumb-img" src="${thumbUrl}" alt="${isVid ? 'video thumbnail' : 'bird photo'}" loading="lazy">
               ${isVid ? '<span class="video-badge-icon">▶</span>' : ''}
               <div class="tile-overlay-top">
                 <span class="pill ${isVid ? 'pill-vid' : 'pill-img'}">${m.media_type.toUpperCase()}</span>
-                ${isSharpest ? `<span class="badge badge-sharpest">⭐ Sharpest</span>` : ''}
+                ${isBestView ? `<span class="badge badge-best-view">Best View</span>` : ''}
                 ${isDeleted ? `<span class="badge badge-removed">[Removed]</span>` : ''}
               </div>
             </div>
             <div class="tile-footer">
               <div class="tile-details">
-                <span>${sharpScore ? 'Sharpness: <strong>' + escapeHtml(sharpScore) + '</strong>' : (isVid ? 'Video Clip' : '')}</span>
+                <span>${birdScore != null ? 'Bird Likelihood: <strong>' + escapeHtml(birdScore) + '%</strong>' : (isVid ? 'Video Clip' : 'No Bird Detected')}</span>
                 <span>${formatRelative(m.created_at)}</span>
               </div>
               <div class="tile-actions">
@@ -2008,8 +2129,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             el.dataset.mediaType,
             el.dataset.species,
             el.dataset.feeder,
-            el.dataset.sharpness,
-            el.dataset.sharpest === 'true'
+            el.dataset.birdScore,
+            el.dataset.bestView === 'true'
           );
         });
       });
@@ -2105,7 +2226,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       }
     }
 
-    function openModal(mediaId, mediaType, species, feeder, sharpness, isSharpest) {
+    function openModal(mediaId, mediaType, species, feeder, birdScore, isBestView) {
       const container = document.getElementById("modalMediaContainer");
       const caption = document.getElementById("modalCaption");
       const viewUrl = `/api/media/${encodeURIComponent(mediaId)}/view`;
@@ -2121,9 +2242,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         container.appendChild(img);
       }
 
-      let sharpText = sharpness ? ` | Sharpness Variance: <strong>${escapeHtml(sharpness)}</strong>` : '';
-      if (isSharpest) sharpText += ' <span style="color:var(--gold); font-weight:bold;">(⭐ Sharpest of Sighting)</span>';
-      caption.innerHTML = `<strong>${escapeHtml(species)}</strong> - ${escapeHtml(feeder)}${sharpText}`;
+      let birdText = (birdScore !== '' && birdScore != null) ? ` | Bird Likelihood: <strong>${escapeHtml(birdScore)}%</strong>` : '';
+      if (isBestView) birdText += ' <span style="color:var(--gold); font-weight:bold;">(Best View)</span>';
+      caption.innerHTML = `<strong>${escapeHtml(species)}</strong> - ${escapeHtml(feeder)}${birdText}`;
 
       document.getElementById("mediaModal").classList.add("active");
     }
@@ -2187,8 +2308,11 @@ async def handle_index(request: web.Request) -> web.Response:
 async def handle_api_status(request: web.Request) -> web.Response:
     """Return JSON status report including sync info, feeder statistics, and top 5 recent sightings."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
+    min_conf = getattr(downloader.args, "min_bird_confidence", 0.25)
     stats = get_feeder_download_stats(downloader.conn)
-    sightings = get_recent_sightings(downloader.conn, days=7, limit=5)
+    sightings = get_recent_sightings(
+        downloader.conn, days=7, limit=5, min_bird_confidence=min_conf
+    )
 
     hardware_feeders = []
     if downloader.feeders_map:
@@ -2265,6 +2389,7 @@ def check_api_auth(request: web.Request, downloader: BirdBuddyDownloader) -> boo
 async def handle_api_sightings(request: web.Request) -> web.Response:
     """Return recent sightings grouped by sighting_id with pagination."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
+    min_conf = getattr(downloader.args, "min_bird_confidence", 0.25)
     try:
         days = max(1, int(request.query.get("days", "7")))
         page = max(1, int(request.query.get("page", "1")))
@@ -2278,7 +2403,9 @@ async def handle_api_sightings(request: web.Request) -> web.Response:
             status=400,
         )
 
-    all_sightings = get_recent_sightings(downloader.conn, days=days, limit=0)
+    all_sightings = get_recent_sightings(
+        downloader.conn, days=days, limit=0, min_bird_confidence=min_conf
+    )
     total_sightings = len(all_sightings)
 
     if per_page > 0:
@@ -2787,6 +2914,23 @@ def parse_args():
         action="store_true",
         default=str_to_bool(os.getenv("NO_WEB", "false")),
         help="Disable embedded web status dashboard",
+    )
+    parser.add_argument(
+        "--min-bird-confidence",
+        type=float,
+        default=str_to_float(os.getenv("MIN_BIRD_CONFIDENCE"), 0.25),
+        help="Minimum detection confidence threshold to count as a bird match (default: 0.25 or MIN_BIRD_CONFIDENCE env var)",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=os.getenv("BIRD_MODEL_PATH", "models/yolov8n.onnx"),
+        help="Path to ONNX object detection model for bird identification (default: models/yolov8n.onnx or BIRD_MODEL_PATH env var)",
+    )
+    parser.add_argument(
+        "--no-detect",
+        action="store_true",
+        default=str_to_bool(os.getenv("NO_DETECT", "false")),
+        help="Skip bird detection likelihood scoring on downloaded images",
     )
     parser.add_argument(
         "-v",
