@@ -2,7 +2,7 @@
 FROM python:3.11-slim AS model-builder
 WORKDIR /build
 RUN pip install --no-cache-dir ultralytics && \
-    python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12)"
+    python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
 
 # Stage 2: Final runtime container image
 FROM python:3.11-slim
