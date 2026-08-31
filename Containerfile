@@ -1,7 +1,13 @@
 # Stage 1: Export lightweight YOLO nano ONNX model for bird detection
 FROM python:3.11-slim AS model-builder
 WORKDIR /build
-RUN pip install --no-cache-dir ultralytics && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
+    pip install --no-cache-dir ultralytics onnx && \
     python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
 
 # Stage 2: Final runtime container image
