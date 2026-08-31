@@ -75,7 +75,7 @@ When running locally outside of the container, export or place the YOLO nano ONN
 ```bash
 # Export yolo26n.onnx using ultralytics (one-time setup)
 pip install ultralytics
-python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12)"
+python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
 mkdir -p models && mv yolo26n.onnx models/yolo26n.onnx
 ```
 *Note: In container deployments, the model is automatically bundled during the build. If running locally without a model, you can provide a custom path via `--model-path` / `BIRD_MODEL_PATH` or disable detection using `--no-detect`.*
