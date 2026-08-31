@@ -74,8 +74,8 @@ pip install -r requirements.txt
 When running locally outside of the container, export or place the YOLO nano ONNX model in `models/yolo26n.onnx`:
 ```bash
 # Export yolo26n.onnx using ultralytics (one-time setup)
-pip install ultralytics
-python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
+python -m pip install ultralytics
+python -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
 mkdir -p models && mv yolo26n.onnx models/yolo26n.onnx
 ```
 *Note: In container deployments, the model is automatically bundled during the build. If running locally without a model, you can provide a custom path via `--model-path` / `BIRD_MODEL_PATH` or disable detection using `--no-detect`.*
@@ -143,6 +143,8 @@ A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`
 - `DOCKERHUB_TOKEN`: Docker Hub Personal Access Token (PAT) with Read/Write permissions.
 
 ---
+
+## Directory & Filename Templating
 
 You can define custom directory structures and filenames using `--dir-template` and `--filename-template` flags (or `DIR_TEMPLATE` and `FILENAME_TEMPLATE` in `.env`).
 
@@ -225,38 +227,41 @@ To scan for and download all new images and videos from all cameras:
 ### Command Line Options
 
 ```text
-usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME] [--password PASSWORD]
-                     [--download-dir DOWNLOAD_DIR] [--db-path DB_PATH]
-                     [--dir-template DIR_TEMPLATE] [--filename-template FILENAME_TEMPLATE]
-                     [--buffer-hours BUFFER_HOURS] [--db-retention-days DB_RETENTION_DAYS]
-                     [--full-sync] [--interval INTERVAL] [--max-pages MAX_PAGES]
-                     [--no-images] [--no-videos] [--feeder-filter FEEDER_FILTER] [--dry-run]
-                     [--info] [--json] [--web-port WEB_PORT] [--web-host WEB_HOST]
+usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME]
+                     [--password PASSWORD] [--download-dir DOWNLOAD_DIR]
+                     [--db-path DB_PATH] [--dir-template DIR_TEMPLATE]
+                     [--filename-template FILENAME_TEMPLATE]
+                     [--buffer-hours BUFFER_HOURS]
+                     [--db-retention-days DB_RETENTION_DAYS] [--full-sync]
+                     [--interval INTERVAL] [--max-pages MAX_PAGES]
+                     [--no-images] [--no-videos]
+                     [--feeder-filter FEEDER_FILTER] [--dry-run] [--info]
+                     [--json] [--web-port WEB_PORT] [--web-host WEB_HOST]
                      [--web-api-key WEB_API_KEY] [--no-web]
-                     [--min-bird-confidence MIN_BIRD_CONFIDENCE] [--model-path MODEL_PATH]
-                     [--no-detect] [-v]
+                     [--min-bird-confidence MIN_BIRD_CONFIDENCE]
+                     [--model-path MODEL_PATH] [--no-detect] [-v]
 
-Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, and feeder info.
+Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, web dashboard, and feeder info.
 
 options:
   -h, --help            show this help message and exit
   --env-file ENV_FILE   Path to .env file containing credentials (default: .env)
-  --username USERNAME   Bird Buddy account email (overrides .env)
-  --password PASSWORD   Bird Buddy account password (overrides .env)
+  --username USERNAME   Bird Buddy account email (overrides USERNAME env var)
+  --password PASSWORD   Bird Buddy account password (overrides PASSWORD env var)
   --download-dir DOWNLOAD_DIR
-                        Directory to save downloaded media (default: ./downloads)
-  --db-path DB_PATH     SQLite DB path for de-duplication (default: ./birdbuddy_downloader.db)
+                        Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)
+  --db-path DB_PATH     SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)
   --dir-template DIR_TEMPLATE
                         Template for output subdirectories relative to download-dir (default: '{feeder_name}/{species_name}').
   --filename-template FILENAME_TEMPLATE
                         Template for output filenames (default: '{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}').
   --buffer-hours BUFFER_HOURS
-                        Hours before latest downloaded detection to start fetching feed items (default: 2.0)
+                        Hours before latest downloaded detection to start fetching feed items (default: 2.0 or BUFFER_HOURS env var)
   --db-retention-days DB_RETENTION_DAYS
-                        Days to retain records in database before cleanup (default: 14; set to 0 to disable)
+                        Days to retain records in database before cleanup (default: 14 or DB_RETENTION_DAYS env var; set to 0 to disable)
   --full-sync           Bypass latest detection cutoff and perform a full feed sync
-  --interval INTERVAL   Interval in seconds for continuous polling mode (0 for single run)
-  --max-pages MAX_PAGES Maximum feed pages to fetch (0 for unlimited)
+  --interval INTERVAL   Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)
+  --max-pages MAX_PAGES Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)
   --no-images           Skip downloading image files
   --no-videos           Skip downloading video files
   --feeder-filter FEEDER_FILTER
@@ -270,9 +275,9 @@ options:
                         Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)
   --no-web              Disable embedded web status dashboard
   --min-bird-confidence MIN_BIRD_CONFIDENCE
-                        Minimum detection confidence threshold to count as a bird match (default: 0.25)
+                        Minimum detection confidence threshold to count as a bird match (default: 0.25 or MIN_BIRD_CONFIDENCE env var)
   --model-path MODEL_PATH
-                        Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx)
+                        Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)
   --no-detect           Skip bird detection likelihood scoring on downloaded images
   -v, --verbose         Enable debug logging
 ```
