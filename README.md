@@ -33,9 +33,10 @@ An automated python utility to download images and videos from all Bird Buddy ca
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
 - **Web Status Dashboard & Sighting Gallery**:
   - Embedded real-time web dashboard running on port `8080` (configurable via `--web-port` / `WEB_PORT`).
-  - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (showing the 5 most recent sets by default with an expandable toggle for all 7-day events).
-  - **OpenCV Image Sharpness Rating**: Evaluates image sharpness using the variance of Laplacian method (`cv2.Laplacian`), caching the rating in SQLite while the media record is retained and highlighting the **"⭐ Sharpest"** image in each sighting group.
-  - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails.
+  - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (with synchronized pagination controls at the top right and bottom right of the section).
+  - **Automated Bird Detection & Likelihood Scoring**: Evaluates image bird presence and confidence via OpenCV DNN using a bundled lightweight YOLO object detection model.
+  - **"Best View" Highlighting**: Automatically tags and highlights the image with the highest bird detection likelihood ($\ge \text{--min-bird-confidence}$, default `0.25`) within each sighting group with a **"Best View"** badge and gold border. If all scored images fall below the confidence threshold, no image is highlighted; when detection scores are not available, the first eligible image in the group is selected.
+  - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails, including bird likelihood percentages.
   - **Soft Delete & Temporary Trash Storage**: Move unwanted files to a `.trash/` directory directly from the UI with a `🗑️ Delete` button. Deleted files remain visible with a `[Removed]` badge and can be reverted with `↩️ Restore`.
   - **Automated Trash Purging**: Files in `.trash/` are permanently removed from disk when their database record ages out (`--db-retention-days 14`), while active downloads are preserved.
   - Displays sync interval, last sync execution time/status, next scheduled sync countdown, and connected feeder hardware status.
@@ -69,7 +70,17 @@ Install all required packages from `requirements.txt`:
 pip install -r requirements.txt
 ```
 
-### 4. Configure Credentials & Options
+### 4. (Optional) Provision Bird Detection Model
+When running locally outside of the container, export or place the YOLO nano ONNX model in `models/yolo26n.onnx`:
+```bash
+# Export yolo26n.onnx using ultralytics (one-time setup)
+python -m pip install ultralytics
+python -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
+mkdir -p models && mv yolo26n.onnx models/yolo26n.onnx
+```
+*Note: In container deployments, the model is automatically bundled during the build. If running locally without a model, you can provide a custom path via `--model-path` / `BIRD_MODEL_PATH` or disable detection using `--no-detect`.*
+
+### 5. Configure Credentials & Options
 Edit the `.env` file with your Bird Buddy account email and password (and optional configuration):
 ```env
 USERNAME="your_email@example.com"
@@ -78,6 +89,8 @@ PASSWORD="your_password"
 # Optional settings
 # BUFFER_HOURS=2.0
 # DB_RETENTION_DAYS=14
+# MIN_BIRD_CONFIDENCE=0.25
+# BIRD_MODEL_PATH="models/yolo26n.onnx"
 # DIR_TEMPLATE="{feeder_name}/{species_name}/{date}_{detection_id_short}"
 # FILENAME_TEMPLATE="{detection_id_short}_{id_short}.{ext}"
 ```
@@ -130,6 +143,8 @@ A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`
 - `DOCKERHUB_TOKEN`: Docker Hub Personal Access Token (PAT) with Read/Write permissions.
 
 ---
+
+## Directory & Filename Templating
 
 You can define custom directory structures and filenames using `--dir-template` and `--filename-template` flags (or `DIR_TEMPLATE` and `FILENAME_TEMPLATE` in `.env`).
 
@@ -212,35 +227,41 @@ To scan for and download all new images and videos from all cameras:
 ### Command Line Options
 
 ```text
-usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME] [--password PASSWORD]
-                     [--download-dir DOWNLOAD_DIR] [--db-path DB_PATH]
-                     [--dir-template DIR_TEMPLATE] [--filename-template FILENAME_TEMPLATE]
-                     [--buffer-hours BUFFER_HOURS] [--db-retention-days DB_RETENTION_DAYS]
-                     [--full-sync] [--interval INTERVAL] [--max-pages MAX_PAGES]
-                     [--no-images] [--no-videos] [--feeder-filter FEEDER_FILTER] [--dry-run]
-                     [--info] [--json] [-v]
+usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME]
+                     [--password PASSWORD] [--download-dir DOWNLOAD_DIR]
+                     [--db-path DB_PATH] [--dir-template DIR_TEMPLATE]
+                     [--filename-template FILENAME_TEMPLATE]
+                     [--buffer-hours BUFFER_HOURS]
+                     [--db-retention-days DB_RETENTION_DAYS] [--full-sync]
+                     [--interval INTERVAL] [--max-pages MAX_PAGES]
+                     [--no-images] [--no-videos]
+                     [--feeder-filter FEEDER_FILTER] [--dry-run] [--info]
+                     [--json] [--web-port WEB_PORT] [--web-host WEB_HOST]
+                     [--web-api-key WEB_API_KEY] [--no-web]
+                     [--min-bird-confidence MIN_BIRD_CONFIDENCE]
+                     [--model-path MODEL_PATH] [--no-detect] [-v]
 
-Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, and feeder info.
+Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, web dashboard, and feeder info.
 
 options:
   -h, --help            show this help message and exit
   --env-file ENV_FILE   Path to .env file containing credentials (default: .env)
-  --username USERNAME   Bird Buddy account email (overrides .env)
-  --password PASSWORD   Bird Buddy account password (overrides .env)
+  --username USERNAME   Bird Buddy account email (overrides USERNAME env var)
+  --password PASSWORD   Bird Buddy account password (overrides PASSWORD env var)
   --download-dir DOWNLOAD_DIR
-                        Directory to save downloaded media (default: ./downloads)
-  --db-path DB_PATH     SQLite DB path for de-duplication (default: ./birdbuddy_downloader.db)
+                        Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)
+  --db-path DB_PATH     SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)
   --dir-template DIR_TEMPLATE
                         Template for output subdirectories relative to download-dir (default: '{feeder_name}/{species_name}').
   --filename-template FILENAME_TEMPLATE
                         Template for output filenames (default: '{year}{month}{day}_{hour}{minute}{second}_{media_id_short}.{ext}').
   --buffer-hours BUFFER_HOURS
-                        Hours before latest downloaded detection to start fetching feed items (default: 2.0)
+                        Hours before latest downloaded detection to start fetching feed items (default: 2.0 or BUFFER_HOURS env var)
   --db-retention-days DB_RETENTION_DAYS
-                        Days to retain records in database before cleanup (default: 14; set to 0 to disable)
+                        Days to retain records in database before cleanup (default: 14 or DB_RETENTION_DAYS env var; set to 0 to disable)
   --full-sync           Bypass latest detection cutoff and perform a full feed sync
-  --interval INTERVAL   Interval in seconds for continuous polling mode (0 for single run)
-  --max-pages MAX_PAGES Maximum feed pages to fetch (0 for unlimited)
+  --interval INTERVAL   Interval in seconds for continuous polling mode (0 for single run or INTERVAL env var)
+  --max-pages MAX_PAGES Maximum feed pages to fetch (0 for unlimited or MAX_PAGES env var)
   --no-images           Skip downloading image files
   --no-videos           Skip downloading video files
   --feeder-filter FEEDER_FILTER
@@ -250,7 +271,14 @@ options:
   --json                Output --info as raw JSON
   --web-port WEB_PORT   Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)
   --web-host WEB_HOST   Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)
+  --web-api-key WEB_API_KEY
+                        Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)
   --no-web              Disable embedded web status dashboard
+  --min-bird-confidence MIN_BIRD_CONFIDENCE
+                        Minimum detection confidence threshold to count as a bird match (default: 0.25 or MIN_BIRD_CONFIDENCE env var)
+  --model-path MODEL_PATH
+                        Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)
+  --no-detect           Skip bird detection likelihood scoring on downloaded images
   -v, --verbose         Enable debug logging
 ```
 

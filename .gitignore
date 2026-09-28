@@ -18,3 +18,8 @@ __pycache__/
 
 # Temp files
 *.tmp
+
+# ML models & weights (bundled in container build)
+models/
+*.onnx
+*.pt
