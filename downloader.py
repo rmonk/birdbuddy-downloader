@@ -316,6 +316,13 @@ def record_media_downloaded(
         )
 
 
+def is_path_within_dir(path: str, directory: str) -> bool:
+    """Return True if path resolves to a location inside directory (no traversal)."""
+    base = os.path.realpath(directory)
+    target = os.path.realpath(path)
+    return target.startswith(base + os.sep)
+
+
 def soft_delete_media(
     conn: sqlite3.Connection, download_dir: str, media_id: str
 ) -> bool:
@@ -334,8 +341,12 @@ def soft_delete_media(
 
     trash_dir = os.path.join(download_dir, ".trash")
     os.makedirs(trash_dir, exist_ok=True)
-    filename = os.path.basename(file_path) if file_path else f"{media_id}_file.tmp"
-    target_trash_path = os.path.join(trash_dir, f"{media_id}_{filename}")
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", media_id)
+    filename = os.path.basename(file_path) if file_path else f"{safe_id}_file.tmp"
+    target_trash_path = os.path.join(trash_dir, f"{safe_id}_{filename}")
+    if not is_path_within_dir(target_trash_path, trash_dir):
+        logger.error(f"Refusing to move media {media_id}: trash path escapes .trash/")
+        return False
 
     if file_path and os.path.exists(file_path):
         try:
@@ -358,7 +369,7 @@ def soft_delete_media(
     return True
 
 
-def restore_media(conn: sqlite3.Connection, media_id: str) -> bool:
+def restore_media(conn: sqlite3.Connection, download_dir: str, media_id: str) -> bool:
     """Restore soft-deleted media file from .trash/ back to its original location."""
     cursor = conn.cursor()
     cursor.execute(
@@ -375,6 +386,12 @@ def restore_media(conn: sqlite3.Connection, media_id: str) -> bool:
     if not trash_path or not os.path.exists(trash_path) or not file_path:
         logger.warning(
             f"Cannot restore media {media_id}: trash file does not exist on disk ({trash_path})"
+        )
+        return False
+
+    if not is_path_within_dir(trash_path, os.path.join(download_dir, ".trash")):
+        logger.error(
+            f"Refusing to restore media {media_id}: trash path {trash_path} is outside .trash/"
         )
         return False
 
@@ -2664,7 +2681,7 @@ async def handle_media_restore(request: web.Request) -> web.Response:
             {"status": "error", "message": "media_id required"}, status=400
         )
 
-    success = restore_media(downloader.conn, media_id)
+    success = restore_media(downloader.conn, downloader.args.download_dir, media_id)
     if success:
         return web.json_response({"status": "restored", "media_id": media_id})
     return web.json_response(
