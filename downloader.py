@@ -1010,9 +1010,10 @@ class BirdBuddyDownloader:
     async def _refresh_keeping_rotated_token(self, bb, start_token: str | None):
         """Run bb.refresh() as the active client and return (succeeded, error).
 
-        Bird Buddy rotates the refresh token before the profile query, and the old
-        token may stop working. If the attempt fails or is cancelled after the
-        rotation, the new token is saved. A token that never changed is not saved,
+        The token refresh runs before the profile query and may hand back a new
+        refresh token (pybirdbuddy stores whatever authRefreshToken returns). If
+        the attempt fails or is cancelled after the token changed, the new token
+        is saved. A token that never changed is not saved,
         so a failed stale token cannot replace a good saved session. A failed
         client is dropped here too, so no later cleanup can save its token.
         """
