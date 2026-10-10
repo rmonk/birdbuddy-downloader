@@ -15,7 +15,7 @@ This document provides architectural context, development guidelines, CLI flags,
 - **Incremental Syncing**: Uses the latest DB capture timestamp minus a 2-hour buffer (`--buffer-hours 2.0`) as the cutoff point to halt feed pagination early for maximum efficiency.
 - **Automated Database Cleanup**: Automatically purges database records older than 14 days (`--db-retention-days 14`) after each run.
 - **Web Status Dashboard**: Embedded web interface (`--web-port 8080`) displaying sync interval, last sync timestamp/status, next sync countdown, and per-feeder download breakdown across the past hour, day (24h), and week (7d).
-- **Persistent Auth & Session Resilience**: Retains OAuth tokens across intervals, refreshing access tokens without triggering repeated full password logins.
+- **Persistent Auth & Session Resilience**: Saves the refresh token to a session file (`session.json` next to the DB, `--session-path`) after every sign-in, refresh and sync cycle, so restarts resume the session instead of repeating the password login. The file also records the account email, and a session for a different `USERNAME` is skipped. `--refresh-token` seeds a session without a password.
 - **Robust Sockets & Timeouts**: Granular connection (`15s`) and socket read (`30s`) timeouts prevent network stalls from hanging the daemon.
 - **Account & Hardware Reporting**: Detailed camera information (`--info`), including battery level, food level, Wi-Fi signal, date ranges, and species counts.
 - **Dry-Run Mode**: Non-destructive preview (`--dry-run`) of files to be downloaded versus skipped.
@@ -118,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 | `--env-file` | `.env` | Path to `.env` file containing credentials |
 | `--username` | Env `USERNAME` | Bird Buddy account email |
 | `--password` | Env `PASSWORD` | Bird Buddy account password |
+| `--refresh-token` | Env `REFRESH_TOKEN` | Refresh token to sign in without a password (used when there is no saved session, or the saved one fails) |
+| `--session-path` | `session.json` next to `--db-path` | Session file holding the refresh token across restarts (or `SESSION_PATH`) |
 | `--download-dir` | `./downloads` | Root directory for downloaded media |
 | `--db-path` | `./birdbuddy_downloader.db` | Path to SQLite de-duplication database |
 | `--dir-template` | `{feeder_name}/{species_name}` | Output subdirectory template relative to `--download-dir` |
@@ -148,9 +150,10 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 
 When making code edits or refactoring, verify the following:
 
-1. **Syntax, Imports & Black Formatting**:
+1. **Syntax, Imports, Unit Tests & Black Formatting**:
    ```bash
    ./venv/bin/black --check .
+   ./venv/bin/python3 -m unittest discover -s tests
    ./venv/bin/python3 -c "import downloader; print('OK')"
    ```
 2. **Dry Run & Incremental Cutoff**:

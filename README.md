@@ -43,7 +43,10 @@ An automated python utility to download images and videos from all Bird Buddy ca
   - Shows breakdown table of photos and videos downloaded over the **past hour**, **past day (24 hours)**, and **past week (7 days)** per camera feeder and overall totals.
   - Provides a "Sync Now" button to trigger immediate on-demand syncing.
 - **Session Resilience & Anti-Throttling**:
-  - Automatically preserves and refreshes OAuth tokens across runs, preventing excessive password authentication that causes account/IP throttling.
+  - Saves the Bird Buddy refresh token to a session file (`session.json` next to the database, override with `--session-path` / `SESSION_PATH`) and refreshes it across runs and container restarts, so the password sign-in only happens once instead of on every start. Repeated password sign-ins can get the account or IP throttled.
+  - The session file records which account it belongs to; a saved session for a different `USERNAME` is ignored.
+  - The session file is written with owner-only permissions; treat it like a password. If it cannot be written, the error is logged and the session lives only in memory until the next restart; a setup without `PASSWORD` then needs a new `REFRESH_TOKEN`.
+  - `--refresh-token` / `REFRESH_TOKEN` signs in with an existing refresh token instead of a password. It is used when there is no saved session yet, or when the saved one stops working; after that the session file takes over.
 - **Robust Sockets & Timeouts**:
   - Granular connection (`15s`) and socket read (`30s`) timeouts prevent network stalls from hanging the daemon.
 - **Media Filtering**: Option to skip videos (`--no-videos`), skip images (`--no-images`), or filter by specific feeder name (`--feeder-filter`).
@@ -228,7 +231,8 @@ To scan for and download all new images and videos from all cameras:
 
 ```text
 usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME]
-                     [--password PASSWORD] [--download-dir DOWNLOAD_DIR]
+                     [--password PASSWORD] [--refresh-token REFRESH_TOKEN]
+                     [--session-path SESSION_PATH] [--download-dir DOWNLOAD_DIR]
                      [--db-path DB_PATH] [--dir-template DIR_TEMPLATE]
                      [--filename-template FILENAME_TEMPLATE]
                      [--buffer-hours BUFFER_HOURS]
@@ -248,6 +252,10 @@ options:
   --env-file ENV_FILE   Path to .env file containing credentials (default: .env)
   --username USERNAME   Bird Buddy account email (overrides USERNAME env var)
   --password PASSWORD   Bird Buddy account password (overrides PASSWORD env var)
+  --refresh-token REFRESH_TOKEN
+                        Bird Buddy refresh token to sign in without a password; used when there is no saved session, or the saved one fails (overrides REFRESH_TOKEN env var)
+  --session-path SESSION_PATH
+                        File that keeps the Bird Buddy session across restarts (default: session.json next to --db-path, or SESSION_PATH env var)
   --download-dir DOWNLOAD_DIR
                         Directory to save downloaded media (default: ./downloads or DOWNLOAD_DIR env var)
   --db-path DB_PATH     SQLite DB path for de-duplication (default: ./data/birdbuddy_downloader.db or DB_PATH env var)

@@ -904,6 +904,38 @@ def render_dest_path(
     return formatted_dir, formatted_filename, dest_path
 
 
+def default_session_path(db_path: str) -> str:
+    """The session file lives next to the SQLite database by default."""
+    return os.path.join(os.path.dirname(os.path.abspath(db_path)), "session.json")
+
+
+def load_session(path: str) -> tuple[str | None, str | None]:
+    """Return the (refresh token, account email) saved in the session file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        token, account = data.get("refresh_token"), data.get("account")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, AttributeError) as e:
+        logger.warning(f"Ignoring unreadable session file {path}: {e}")
+        return None, None
+    if not isinstance(token, str) or not token:
+        return None, None
+    return token, account if isinstance(account, str) and account else None
+
+
+def save_session(path: str, token: str, account: str | None):
+    """Atomically write the session file, readable by the owner only."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp_path = path + ".tmp"
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
+        json.dump({"refresh_token": token, "account": account}, f)
+    os.replace(temp_path, path)
+
+
 class BirdBuddyDownloader:
 
     def __init__(self, args, conn: sqlite3.Connection):
@@ -923,6 +955,8 @@ class BirdBuddyDownloader:
         self.is_syncing = False
         self.next_sync_time: datetime | None = None
         self.last_error: str | None = None
+        self.saved_session: tuple[str, str | None] | None = None
+        self.session_account: str | None = None
 
         self.dir_template = (
             getattr(self.args, "dir_template", None)
@@ -944,11 +978,74 @@ class BirdBuddyDownloader:
         """Trigger an immediate sync cycle without waiting for interval."""
         self.sync_trigger_event.set()
 
+    def _session_path(self) -> str:
+        return getattr(self.args, "session_path", None) or default_session_path(
+            self.args.db_path
+        )
+
+    def save_session(self, unless_token: str | None = None):
+        """Persist the current refresh token so a restart can skip the password sign-in.
+
+        unless_token: skip the save while the client still holds this token. Used
+        after a failed attempt, so only a token that actually rotated is kept.
+        """
+        token = getattr(self.bb, "_refresh_token", None) if self.bb else None
+        if not token or token == unless_token:
+            return
+        # Only the profile, or a password sign-in, says whose token this is. A
+        # resumed token stays unbound until its profile loads.
+        user = self.bb.user or {}
+        account = user.get("email") or self.session_account
+        if (token, account) == self.saved_session:
+            return
+        path = self._session_path()
+        try:
+            save_session(path, token, account)
+            self.saved_session = (token, account)
+        except OSError as e:
+            # The session then lives only in memory: a password setup signs in
+            # again after a restart, a token-only one needs a new REFRESH_TOKEN.
+            logger.error(f"Could not save Bird Buddy session to {path}: {e}")
+
+    async def _refresh_keeping_rotated_token(self, bb, start_token: str | None):
+        """Run bb.refresh() as the active client and return (succeeded, error).
+
+        Bird Buddy rotates the refresh token before the profile query, and the old
+        token may stop working. If the attempt fails or is cancelled after the
+        rotation, the new token is saved. A token that never changed is not saved,
+        so a failed stale token cannot replace a good saved session. A failed
+        client is dropped here too, so no later cleanup can save its token.
+        """
+        self.bb = bb
+        succeeded, error = False, None
+        try:
+            succeeded = bool(await bb.refresh())
+        except Exception as e:
+            error = e
+        finally:
+            if not succeeded:
+                self.save_session(unless_token=start_token)
+                self.bb = None
+        return succeeded, error
+
+    def _on_authenticated(self) -> bool:
+        self.feeders_map = self.bb.feeders or {}
+        logger.info(
+            f"Successfully authenticated! Found {len(self.feeders_map)} connected camera feeder(s):"
+        )
+        for fid, fdata in self.feeders_map.items():
+            name = fdata.get("name", "Unnamed Feeder")
+            owner = fdata.get("ownerName", "Unknown Owner")
+            logger.info(f" - Feeder '{name}' (ID: {fid}, Owner: {owner})")
+        self.last_error = None
+        self.save_session()
+        return True
+
     async def authenticate(self) -> bool:
         """
         Authenticate with Bird Buddy API using persistent session reuse and token refresh.
-        Only performs a full username/password sign-in when initial login is needed
-        or when the refresh token has expired.
+        Reuses the in-memory session, then the refresh token saved in the session file
+        (or REFRESH_TOKEN), and only signs in with username/password when none of those work.
         """
         if self.stop_requested:
             return False
@@ -956,53 +1053,85 @@ class BirdBuddyDownloader:
         username = self.args.username or os.getenv("USERNAME")
         password = self.args.password or os.getenv("PASSWORD")
 
+        if self.bb is not None:
+            succeeded, error = await self._refresh_keeping_rotated_token(
+                self.bb, getattr(self.bb, "_refresh_token", None)
+            )
+            if succeeded:
+                self.feeders_map = self.bb.feeders or {}
+                self.save_session()
+                logger.debug(
+                    "Successfully refreshed existing Bird Buddy session and feeder data."
+                )
+                return True
+            logger.warning(
+                f"Session refresh failed ({error}); re-authenticating..."
+                if error
+                else "Session refresh returned False; re-authenticating..."
+            )
+
+        saved_token, saved_account = load_session(self._session_path())
+        if (
+            saved_token
+            and username
+            and saved_account
+            and saved_account.lower() != username.lower()
+        ):
+            logger.warning(
+                f"Ignoring saved session for {saved_account}; the configured account is {username}."
+            )
+            saved_token = None
+
+        candidates = []  # (refresh token, account it belongs to, if known)
+        if saved_token:
+            candidates.append((saved_token, saved_account))
+        seed_token = getattr(self.args, "refresh_token", None)
+        if seed_token and seed_token != saved_token:
+            candidates.append((seed_token, None))
+
+        for token, account in candidates:
+            if self.stop_requested:
+                return False
+            logger.info("Resuming saved Bird Buddy session...")
+            self.session_account = account
+            succeeded, error = await self._refresh_keeping_rotated_token(
+                BirdBuddy(username, password, refresh_token=token), token
+            )
+            if not succeeded:
+                logger.warning(f"Could not resume saved Bird Buddy session ({error}).")
+                continue
+            # A session saved before its account was known is only checked now.
+            email = (self.bb.user or {}).get("email")
+            if username and email and email.lower() != username.lower():
+                logger.warning(
+                    f"Saved session belongs to {email}, not the configured account {username}."
+                )
+                self.save_session()  # keep its rotated token, bound to its own account
+                self.bb = None
+                continue
+            return self._on_authenticated()
+
         if not username or not password:
             logger.error(
-                "Bird Buddy credentials not specified. Set USERNAME & PASSWORD in .env or pass --username/--password."
+                "Bird Buddy credentials not specified. Set USERNAME & PASSWORD (or REFRESH_TOKEN) in .env or pass --username/--password."
             )
             self.last_error = "Credentials missing"
             return False
 
-        if self.bb is not None:
-            try:
-                success = await self.bb.refresh()
-                if success:
-                    self.feeders_map = self.bb.feeders or {}
-                    logger.debug(
-                        "Successfully refreshed existing Bird Buddy session and feeder data."
-                    )
-                    return True
-                logger.warning(
-                    "Session refresh returned False; re-authenticating with credentials..."
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Session refresh failed ({e}); re-authenticating with credentials..."
-                )
-
         logger.info(f"Authenticating with Bird Buddy account: {username}")
-        self.bb = BirdBuddy(username, password)
-        try:
-            success = await self.bb.refresh()
-            if not success:
-                logger.error("Bird Buddy authentication failed.")
-                self.last_error = "Authentication failed"
-                return False
-
-            self.feeders_map = self.bb.feeders or {}
-            logger.info(
-                f"Successfully authenticated! Found {len(self.feeders_map)} connected camera feeder(s):"
-            )
-            for fid, fdata in self.feeders_map.items():
-                name = fdata.get("name", "Unnamed Feeder")
-                owner = fdata.get("ownerName", "Unknown Owner")
-                logger.info(f" - Feeder '{name}' (ID: {fid}, Owner: {owner})")
-            self.last_error = None
-            return True
-        except Exception as e:
-            logger.error(f"Failed to authenticate: {e}")
-            self.last_error = f"Auth error: {str(e)}"
-            return False
+        self.session_account = username
+        succeeded, error = await self._refresh_keeping_rotated_token(
+            BirdBuddy(username, password), None
+        )
+        if succeeded:
+            return self._on_authenticated()
+        if error is None:
+            logger.error("Bird Buddy authentication failed.")
+            self.last_error = "Authentication failed"
+        else:
+            logger.error(f"Failed to authenticate: {error}")
+            self.last_error = f"Auth error: {str(error)}"
+        return False
 
     async def process_media_item(
         self,
@@ -1638,6 +1767,7 @@ class BirdBuddyDownloader:
             self.last_error = str(e)
         finally:
             self.is_syncing = False
+            self.save_session()
 
 
 # ==============================================================================
@@ -2859,6 +2989,16 @@ def parse_args():
         "--password",
         default=os.getenv("PASSWORD"),
         help="Bird Buddy account password (overrides PASSWORD env var)",
+    )
+    parser.add_argument(
+        "--refresh-token",
+        default=os.getenv("REFRESH_TOKEN"),
+        help="Bird Buddy refresh token to sign in without a password; used when there is no saved session, or the saved one fails (overrides REFRESH_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--session-path",
+        default=os.getenv("SESSION_PATH"),
+        help="File that keeps the Bird Buddy session across restarts (default: session.json next to --db-path, or SESSION_PATH env var)",
     )
     parser.add_argument(
         "--download-dir",

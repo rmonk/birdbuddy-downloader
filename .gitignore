@@ -8,6 +8,7 @@ env/
 
 # Local downloads and database
 downloads/
+session.json
 *.db
 *.sqlite
 
