@@ -27,7 +27,7 @@ An automated python utility to download images and videos from all Bird Buddy ca
 - **De-duplication**: Tracks downloaded media in a local SQLite database (`birdbuddy_downloader.db`). Never downloads the same image or video twice.
 - **Timestamp Preservation**:
   - Sets the file modification time (`mtime` / `atime`) on all images and videos to match the capture timestamp from Bird Buddy metadata.
-  - Embeds EXIF metadata (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) into JPEG image files.
+  - Embeds EXIF metadata (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) into JPEG image files, written in the local timezone with the matching `OffsetTime*` tags so photo libraries such as Immich show the correct local capture time. Set `TZ` (e.g. `TZ=America/New_York`) to the feeder's timezone; it defaults to UTC in containers.
 - **Flexible Execution**:
   - **Single-run mode**: Ideal for running via `cron` or `systemd` timers.
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
@@ -107,6 +107,7 @@ Ensure your `.env` file contains your credentials and desired options:
 USERNAME="your_email@example.com"
 PASSWORD="your_password"
 INTERVAL=3600  # Set to >0 for continuous polling mode in container
+TZ="America/New_York"  # Feeder timezone for EXIF capture times (default: UTC)
 ```
 
 ### 2. Run with `podman-compose` or `docker compose`

@@ -719,12 +719,21 @@ def apply_timestamps_and_exif(file_path: str, dt: datetime, is_image: bool):
 
     if is_image and file_path.lower().endswith((".jpg", ".jpeg")):
         try:
-            formatted_date = dt.strftime("%Y:%m:%d %H:%M:%S")
+            # EXIF dates are wall-clock time, so write them in the local timezone
+            # (set TZ to the feeder's zone) with the offset tags alongside.
+            # Without an offset, photo apps read the time as UTC wall time.
+            local_dt = dt.astimezone()
+            formatted_date = local_dt.strftime("%Y:%m:%d %H:%M:%S").encode("utf-8")
+            utc_offset = local_dt.strftime("%z")
+            formatted_offset = f"{utc_offset[:3]}:{utc_offset[3:]}".encode("utf-8")
             exif_dict = {
-                "0th": {piexif.ImageIFD.DateTime: formatted_date.encode("utf-8")},
+                "0th": {piexif.ImageIFD.DateTime: formatted_date},
                 "Exif": {
-                    piexif.ExifIFD.DateTimeOriginal: formatted_date.encode("utf-8"),
-                    piexif.ExifIFD.DateTimeDigitized: formatted_date.encode("utf-8"),
+                    piexif.ExifIFD.DateTimeOriginal: formatted_date,
+                    piexif.ExifIFD.DateTimeDigitized: formatted_date,
+                    piexif.ExifIFD.OffsetTime: formatted_offset,
+                    piexif.ExifIFD.OffsetTimeOriginal: formatted_offset,
+                    piexif.ExifIFD.OffsetTimeDigitized: formatted_offset,
                 },
             }
             exif_bytes = piexif.dump(exif_dict)
@@ -2841,6 +2850,9 @@ def parse_args():
 
     if os.path.exists(known_args.env_file):
         load_dotenv(known_args.env_file)
+        # The C library caches the timezone; re-read TZ in case .env set it.
+        if hasattr(time, "tzset"):
+            time.tzset()
 
     parser = argparse.ArgumentParser(
         description="Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, web dashboard, and feeder info."

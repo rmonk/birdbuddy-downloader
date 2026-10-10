@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 - `build_template_vars()`: Generates a dictionary of metadata placeholders (`feeder_name`, `species_name`, `detection_id`, `postcard_id`, `sighting_id`, `year`, `month`, `day`, `media_id_short`, etc.).
 - `render_dest_path()`: Safely formats directory and filename strings using `SafeDict` to prevent `KeyError` crashes, sanitizes path components, and ensures correct extensions (`.jpg`/`.mp4`).
 - `download_file()`: Downloads files atomically to `.tmp` files first with explicit socket timeouts, replacing destination upon completion.
-- `apply_timestamps_and_exif()`: Writes EXIF `DateTimeOriginal`, `DateTimeDigitized`, `DateTime` and updates file system modification time (`os.utime`).
+- `apply_timestamps_and_exif()`: Writes EXIF `DateTimeOriginal`, `DateTimeDigitized`, `DateTime` in the local timezone (`TZ`) with the matching `OffsetTime`/`OffsetTimeOriginal`/`OffsetTimeDigitized` tags, and updates file system modification time (`os.utime`).
 
 ---
 
@@ -148,9 +148,10 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 
 When making code edits or refactoring, verify the following:
 
-1. **Syntax, Imports & Black Formatting**:
+1. **Syntax, Imports, Unit Tests & Black Formatting**:
    ```bash
    ./venv/bin/black --check .
+   ./venv/bin/python3 -m unittest discover -s tests
    ./venv/bin/python3 -c "import downloader; print('OK')"
    ```
 2. **Dry Run & Incremental Cutoff**:
