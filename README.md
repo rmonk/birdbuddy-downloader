@@ -300,6 +300,12 @@ Anyone who can reach the dashboard can **view** status, sightings, photos and vi
 | Add / delete users, set roles, reset passwords | | | ✅ |
 | Edit runtime settings (interval, templates, filters, detection) | | | ✅ |
 
+| Guest (read-only) | Admin account menu: passkeys & API keys |
+| :---: | :---: |
+| ![Guest dashboard](docs/screenshots/01-guest-dashboard.png) | ![Account dialog](docs/screenshots/05-account-passkey-and-api-key.png) |
+
+More screenshots of each flow are in [`docs/screenshots/`](docs/screenshots/).
+
 ### First login
 
 On the first start with an empty user table, an `admin` account is created with a random password, which is printed once in the logs:

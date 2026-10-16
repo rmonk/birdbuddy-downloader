@@ -1775,8 +1775,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     body:not(.is-admin) .admin-only { display: none !important; }
     body:not(.guest) .guest-only { display: none !important; }
     body:not(.passkeys-on) .passkey-only { display: none !important; }
-    .user-chip { font-size: 0.85rem; color: var(--text-secondary); }
-    .user-chip strong { color: var(--text-primary); }
+    #accountBtn .role { font-weight: 400; color: var(--text-secondary); }
 
     /* Dialogs */
     .dialog { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; width: min(640px, calc(100vw - 32px)); max-height: 88vh; overflow-y: auto; padding: 22px; position: relative; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
@@ -1806,7 +1805,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
     .setting-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px 0; border-bottom: 1px solid rgba(71, 85, 105, 0.5); align-items: center; }
     .setting-row .input { width: 100%; }
-    .setting-row .muted { grid-column: 1 / -1; }
+    .setting-row .muted, .setting-row .field-error { grid-column: 1 / -1; }
+    .input.input-invalid, .input.input-invalid:focus { border-color: #f87171; outline: 2px solid #f87171; outline-offset: -1px; }
+    .field-error { color: #f87171; font-size: 0.82rem; }
   </style>
 </head>
 <body class="guest">
@@ -1826,8 +1827,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <button class="btn auth-only" id="syncBtn" onclick="triggerSync()">
           <span>⚡ Sync Now</span>
         </button>
-        <span class="user-chip auth-only" id="userChip"></span>
-        <button class="btn btn-secondary auth-only" onclick="openAccount()">👤 Account</button>
+        <button class="btn btn-secondary auth-only" id="accountBtn" onclick="openAccount()" title="Account settings">👤 Account</button>
         <button class="btn btn-secondary admin-only" onclick="openAdmin()">🛠️ Admin</button>
         <button class="btn btn-secondary auth-only" onclick="logout()">Log out</button>
         <button class="btn btn-secondary guest-only" id="loginBtn" onclick="openLogin()">🔑 Log in</button>
@@ -1990,7 +1990,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <form onsubmit="createUser(event)">
           <div class="form-inline">
             <input class="input" id="newUsername" placeholder="Username" required maxlength="64">
-            <input class="input" id="newUserPassword" type="password" placeholder="Password (blank = generate)" autocomplete="new-password">
+            <input class="input" id="newUserPassword" type="password" placeholder="Password (optional)" title="Leave blank to generate a random password" autocomplete="new-password">
             <select class="input" id="newUserRole" style="flex:0 0 auto;">
               <option value="user">user</option>
               <option value="admin">admin</option>
@@ -2373,6 +2373,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (!resp.ok) {
         const err = new Error(data.message || resp.statusText);
         err.status = resp.status;
+        err.data = data;
         throw err;
       }
       return data;
@@ -2396,9 +2397,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.body.classList.toggle("is-admin", !!currentUser && currentUser.role === "admin");
       document.body.classList.toggle("passkeys-on", passkeysEnabled);
       document.getElementById("passkeysDisabledNote").style.display = passkeysEnabled ? "none" : "";
-      document.getElementById("userChip").innerHTML = currentUser
-        ? `<strong>${escapeHtml(currentUser.username)}</strong> (${escapeHtml(currentUser.role)})`
-        : "";
+      document.getElementById("accountBtn").innerHTML = currentUser
+        ? `👤 ${escapeHtml(currentUser.username)} <span class="role">(${escapeHtml(currentUser.role)})</span>`
+        : "👤 Account";
     }
 
     function openDialog(id) { document.getElementById(id).classList.add("active"); }
@@ -2803,6 +2804,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         const current = s.value == null ? (s.type === "str" ? "" : null) : s.value;
         if (val !== current) changes[s.key] = val;
       }
+      document.querySelectorAll("#settingsList .input-invalid").forEach(el => el.classList.remove("input-invalid"));
+      document.querySelectorAll("#settingsList .field-error").forEach(el => el.remove());
       if (!Object.keys(changes).length) {
         setMsg("settingsMsg", "No changes to save.", true);
         return;
@@ -2813,7 +2816,28 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         setMsg("settingsMsg", "Settings saved.", true);
         await loadStatus();
       } catch (err) {
-        setMsg("settingsMsg", err.message, false);
+        const errors = (err.data && err.data.errors) || {};
+        const keys = Object.keys(errors);
+        if (!keys.length) {
+          setMsg("settingsMsg", err.message, false);
+          return;
+        }
+        const labels = Object.fromEntries(loadedSettings.map(s => [s.key, s.label]));
+        setMsg("settingsMsg", keys.map(k => `${labels[k] || k} ${errors[k]}`).join("; "), false);
+        keys.forEach(k => {
+          const el = document.getElementById("setting_" + k);
+          if (!el) return;
+          el.classList.add("input-invalid");
+          const msg = document.createElement("div");
+          msg.className = "field-error";
+          msg.textContent = `${labels[k] || k} ${errors[k]}`;
+          el.parentElement.after(msg);
+        });
+        const first = document.getElementById("setting_" + keys[0]);
+        if (first) {
+          first.scrollIntoView({ block: "center" });
+          first.focus();
+        }
       }
     }
 
