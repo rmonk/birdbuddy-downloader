@@ -33,7 +33,7 @@ RUN mkdir -p /app/models
 COPY --from=model-builder /build/yolo26n.onnx /app/models/yolo26n.onnx
 
 # Copy downloader application script
-COPY downloader.py .
+COPY downloader.py auth.py ./
 
 # Expose default download and database volumes
 VOLUME ["/app/downloads", "/app/data"]
