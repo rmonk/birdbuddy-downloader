@@ -1300,8 +1300,10 @@ class BirdBuddyDownloader:
 
                 if node_type == "FeedItemNewPostcard":
                     postcard_id = node.get("id")
+                    opened = False
                     try:
                         sighting = await self.bb.sighting_from_postcard(postcard_id)
+                        opened = True
                         feeder_info = (sighting.feeder if sighting else {}) or {}
                         feeder_id = feeder_info.get("id", "unknown_feeder")
                         feeder_name = feeder_info.get("name", "Unknown Feeder")
@@ -1406,6 +1408,13 @@ class BirdBuddyDownloader:
                     except Exception as e:
                         if self.stop_requested:
                             break
+                        if opened:
+                            # Opened but not saved: refiling it under an
+                            # unknown species would stick via the de-dup DB.
+                            logger.error(
+                                f"Error processing postcard {postcard_id}: {e}"
+                            )
+                            continue
                         logger.warning(
                             f"Could not open postcard {postcard_id} ({e}). "
                             "Reading its media from the feed instead."

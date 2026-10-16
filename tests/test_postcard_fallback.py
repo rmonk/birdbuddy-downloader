@@ -8,6 +8,7 @@ from unittest import mock
 
 from birdbuddy.exceptions import GraphqlError
 from birdbuddy.feed import Feed
+from birdbuddy.sightings import PostcardSighting
 
 import downloader
 from downloader import BirdBuddyDownloader, init_db
@@ -83,16 +84,20 @@ def video(media_id):
 
 
 class FakeBirdBuddy:
-    """No postcard opens; the feed lists their media item by item."""
+    """Postcards not in `opened` fail to open; the feed lists every
+    postcard's media item by item."""
 
-    def __init__(self, feed=FEED, item_after=ITEM_AFTER):
+    def __init__(self, feed=FEED, item_after=ITEM_AFTER, opened=None):
         self._feed = feed
         self._item_after = item_after
+        self._opened = opened or {}
 
     async def feed(self, first=50, after=None):
         return self._feed
 
     async def sighting_from_postcard(self, postcard_id):
+        if postcard_id in self._opened:
+            return self._opened[postcard_id]
         raise GraphqlError(
             {"message": "Internal server error.", "extensions": {"code": "500"}}
         )
@@ -102,8 +107,12 @@ class FakeBirdBuddy:
         return {"me": {"feed": {"edges": [{"node": node}]}}}
 
 
+# Downloads whose URL or destination contains one of these fail.
+UNWRITABLE = ("unwritable", "Tufted Titmouse")
+
+
 async def fake_download(url, dest_path, stop_checker=None):
-    if "unwritable" in url:
+    if any(s in url or s in dest_path for s in UNWRITABLE):
         raise PermissionError(f"cannot create {os.path.dirname(dest_path)}")
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     with open(dest_path, "wb") as f:
@@ -169,6 +178,45 @@ class PostcardFallbackTest(unittest.TestCase):
         self.assertEqual(downloaded, 1)
         folder = os.path.join(self.media_dir, "Unrecognized Species")
         self.assertEqual(os.listdir(folder), ["vid-b.mp4"])
+
+    def test_opened_postcard_is_not_refiled_when_saving_fails(self):
+        card = postcard("pc-open", "2026-10-15T19:00:00.000Z", [video("vid-t")])
+        opened = PostcardSighting(
+            {
+                "feeder": {"id": "f1", "name": "Feeder"},
+                "medias": [],
+                "videoMedia": video("vid-t"),
+                "sightingReport": {
+                    "sightings": [
+                        {
+                            "id": "s1",
+                            "__typename": "SightingRecognizedBird",
+                            "species": {"name": "Tufted Titmouse"},
+                        }
+                    ]
+                },
+            }
+        )
+        feed = Feed(
+            {
+                "edges": [{"cursor": "c1", "node": {**card, "medias": None}}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+        )
+        self.dl.bb = FakeBirdBuddy(feed, {None: card}, opened={"pc-open": opened})
+
+        with mock.patch.object(downloader, "download_file", fake_download):
+            downloaded = asyncio.run(self.dl.sync_feed())
+
+        # Its species folder failed; the video must not land elsewhere, or
+        # the de-dup record would keep it there for good.
+        self.assertEqual(downloaded, 0)
+        self.assertEqual(
+            os.listdir(self.media_dir) if os.path.isdir(self.media_dir) else [], []
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM downloaded_media").fetchone()[0], 0
+        )
 
 
 if __name__ == "__main__":
