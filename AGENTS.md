@@ -14,6 +14,7 @@ This document provides architectural context, development guidelines, CLI flags,
 - **Custom Templating**: Dynamic subdirectory (`--dir-template`) and filename (`--filename-template`) generation with support for detection/postcard event grouping (`{detection_id}`, `{postcard_id}`, `{sighting_id}`).
 - **Incremental Syncing**: Uses the latest DB capture timestamp minus a 2-hour buffer (`--buffer-hours 2.0`) as the cutoff point to halt feed pagination early for maximum efficiency.
 - **Automated Database Cleanup**: Automatically purges database records older than 14 days (`--db-retention-days 14`) after each run.
+- **Web Authentication**: Guests get read-only access; writes require login. `user`/`admin` roles, scrypt password hashing, session cookies, passkeys (WebAuthn via `webauthn`), per-user API keys, and an admin runtime-settings page (see `auth.py`).
 - **Web Status Dashboard**: Embedded web interface (`--web-port 8080`) displaying sync interval, last sync timestamp/status, next sync countdown, and per-feeder download breakdown across the past hour, day (24h), and week (7d).
 - **Persistent Auth & Session Resilience**: Retains OAuth tokens across intervals, refreshing access tokens without triggering repeated full password logins.
 - **Robust Sockets & Timeouts**: Granular connection (`15s`) and socket read (`30s`) timeouts prevent network stalls from hanging the daemon.
@@ -37,6 +38,7 @@ birdbuddy-downloader/
 ├── docker-compose.yml         # Docker Compose configuration
 ├── podman-compose.yml         # Podman Compose configuration
 ├── downloader.py              # Main Python application entry point
+├── auth.py                    # Web auth: users, sessions, passkeys, API keys, roles, settings
 ├── requirements.txt           # Python dependency requirements
 ├── .env                       # Local credentials (USERNAME, PASSWORD) - DO NOT COMMIT
 ├── .env.example               # Template environment configuration
@@ -63,6 +65,7 @@ birdbuddy-downloader/
 - `piexif` & `pillow`: EXIF manipulation and image handling.
 - `opencv-python-headless` & `numpy`: Image sharpness calculation (variance of Laplacian).
 - `requests` & `aiohttp`: HTTP requests, async downloading, and embedded web status server.
+- `webauthn`: Passkey (WebAuthn) registration and authentication for the web dashboard.
 
 ---
 
@@ -95,6 +98,21 @@ CREATE INDEX IF NOT EXISTS idx_bird_score ON downloaded_media(bird_score);
 CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 ```
 
+Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
+- `users(id, username UNIQUE NOCASE, password_hash, role CHECK IN ('user','admin'), webauthn_user_id, created_at, password_changed_at)`
+- `sessions(token_hash PK, user_id → users ON DELETE CASCADE, created_at, expires_at, last_seen_at)`: only SHA-256 of the cookie token is stored; 14-day sliding expiry.
+- `passkeys(credential_id PK, user_id → users, public_key, sign_count, name, transports, created_at, last_used_at)`
+- `api_keys(id, user_id → users, name, prefix, key_hash UNIQUE, created_at, last_used_at)`: only SHA-256 of the key is stored.
+- `settings(key PK, value JSON, updated_at, updated_by)`: admin overrides applied onto `args` at startup by `apply_settings_overrides()`.
+
+### Web Authentication (`auth.py`)
+- `auth_middleware` resolves `request["user"]` from the `bbd_session` cookie, else `X-API-Key` / `Authorization: Bearer`. Non-GET requests not authenticated by API key must pass an Origin / `Sec-Fetch-Site` same-origin check (CSRF).
+- Guard handlers with `@auth.require_role("user")` or `@auth.require_role("admin")` (401 anonymous, 403 insufficient role). Any new mutating or config endpoint **must** use one of these.
+- `ensure_initial_admin()` creates `admin` with a random password logged at WARNING when the users table is empty (web mode only). `--reset-password USERNAME` is the CLI recovery path.
+- Passkeys require `WEB_PUBLIC_URL` (RP ID = hostname, expected origin = scheme+host). Challenges are single-use, kept in memory for 5 minutes.
+- `SETTINGS_SPEC` whitelists web-editable settings with parsers/validators. Never add credentials, paths or bind addresses to it.
+- Endpoints: `/api/auth/{me,login,logout}`, `/api/auth/passkey/login/{options,verify}`, `/api/account/{password,passkeys,api-keys}`, `/api/admin/{users,settings}`.
+
 ### Key Functions & Classes
 - `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, state tracking, and media downloading.
 - `detect_birds()`: Analyzes downloaded images via OpenCV DNN (`cv2.dnn`) with a lightweight ONNX YOLO object detector to calculate bird presence likelihood and confidence score.
@@ -102,7 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 - `soft_delete_media()` / `restore_media()`: Safely moves deleted files to `.trash/` or restores them to original path.
 - `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days); permanently removes aged `.trash/` files from disk while preserving active files.
 - `get_feeder_download_stats()`: Queries SQLite for per-feeder download breakdown (past hour, 24 hours, 7 days, all-time totals, and recent activity).
-- `create_web_app()`: Sets up the asynchronous `aiohttp.web` dashboard serving HTML and `/api/status`, `/api/sightings`, `/api/media/{id}/view`, `/api/media/{id}/thumb`, `/api/media/delete`, `/api/media/restore`, `/api/sync` endpoints.
+- `create_web_app()`: Sets up the asynchronous `aiohttp.web` dashboard serving HTML and `/api/status`, `/api/sightings`, `/api/media/{id}/view`, `/api/media/{id}/thumb`, `/api/media/delete`, `/api/media/restore`, `/api/sync` endpoints, plus the auth routes registered by `auth.setup_auth()`.
 - `get_latest_download_timestamp()`: Finds the max `created_at` timestamp in SQLite to calculate the incremental sync cutoff.
 - `build_template_vars()`: Generates a dictionary of metadata placeholders (`feeder_name`, `species_name`, `detection_id`, `postcard_id`, `sighting_id`, `year`, `month`, `day`, `media_id_short`, etc.).
 - `render_dest_path()`: Safely formats directory and filename strings using `SafeDict` to prevent `KeyError` crashes, sanitizes path components, and ensures correct extensions (`.jpg`/`.mp4`).
@@ -138,7 +156,8 @@ CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted);
 | `--json` | `False` | Output `--info` as raw JSON |
 | `--web-port` | `8080` | Port for embedded web status dashboard (or `WEB_PORT` env var) |
 | `--web-host` | `0.0.0.0` | Host to bind embedded web dashboard (or `WEB_HOST` env var) |
-| `--web-api-key` | `None` | Optional API key secret to protect mutating endpoints |
+| `--web-public-url` | `None` | Public HTTPS URL (or `WEB_PUBLIC_URL`); enables passkeys and Secure cookies |
+| `--reset-password` | `None` | Set a new random web password for USERNAME, print it, and exit |
 | `--no-web` | `False` | Disable embedded web status dashboard |
 | `-v`, `--verbose` | `False` | Enable debug logging |
 
@@ -151,7 +170,7 @@ When making code edits or refactoring, verify the following:
 1. **Syntax, Imports & Black Formatting**:
    ```bash
    ./venv/bin/black --check .
-   ./venv/bin/python3 -c "import downloader; print('OK')"
+   ./venv/bin/python3 -c "import downloader, auth; print('OK')"
    ```
 2. **Dry Run & Incremental Cutoff**:
    ```bash

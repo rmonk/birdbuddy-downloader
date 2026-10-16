@@ -37,6 +37,7 @@ An automated python utility to download images and videos from all Bird Buddy ca
   - **Automated Bird Detection & Likelihood Scoring**: Evaluates image bird presence and confidence via OpenCV DNN using a bundled lightweight YOLO object detection model.
   - **"Best View" Highlighting**: Automatically tags and highlights the image with the highest bird detection likelihood ($\ge \text{--min-bird-confidence}$, default `0.25`) within each sighting group with a **"Best View"** badge and gold border. If all scored images fall below the confidence threshold, no image is highlighted; when detection scores are not available, the first eligible image in the group is selected.
   - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails, including bird likelihood percentages.
+  - **User Accounts & Passkeys**: Guests can browse; deleting, restoring, syncing and changing settings require login. Supports `user`/`admin` roles, passkeys (WebAuthn), per-user API keys, and an admin settings page. See [Web Dashboard Authentication](#web-dashboard-authentication).
   - **Soft Delete & Temporary Trash Storage**: Move unwanted files to a `.trash/` directory directly from the UI with a `🗑️ Delete` button. Deleted files remain visible with a `[Removed]` badge and can be reverted with `↩️ Restore`.
   - **Automated Trash Purging**: Files in `.trash/` are permanently removed from disk when their database record ages out (`--db-retention-days 14`), while active downloads are preserved.
   - Displays sync interval, last sync execution time/status, next scheduled sync countdown, and connected feeder hardware status.
@@ -237,7 +238,8 @@ usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME]
                      [--no-images] [--no-videos]
                      [--feeder-filter FEEDER_FILTER] [--dry-run] [--info]
                      [--json] [--web-port WEB_PORT] [--web-host WEB_HOST]
-                     [--web-api-key WEB_API_KEY] [--no-web]
+                     [--web-public-url WEB_PUBLIC_URL]
+                     [--reset-password USERNAME] [--no-web]
                      [--min-bird-confidence MIN_BIRD_CONFIDENCE]
                      [--model-path MODEL_PATH] [--no-detect] [-v]
 
@@ -271,8 +273,10 @@ options:
   --json                Output --info as raw JSON
   --web-port WEB_PORT   Port for embedded web status dashboard (default: 8080 or WEB_PORT env var)
   --web-host WEB_HOST   Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)
-  --web-api-key WEB_API_KEY
-                        Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)
+  --web-public-url WEB_PUBLIC_URL
+                        Public HTTPS URL of the dashboard, e.g. https://birds.example.com (or WEB_PUBLIC_URL env var). Required for passkey login; also marks session cookies Secure
+  --reset-password USERNAME
+                        Set a new random web dashboard password for USERNAME, print it, and exit
   --no-web              Disable embedded web status dashboard
   --min-bird-confidence MIN_BIRD_CONFIDENCE
                         Minimum detection confidence threshold to count as a bird match (default: 0.25 or MIN_BIRD_CONFIDENCE env var)
@@ -280,6 +284,68 @@ options:
                         Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)
   --no-detect           Skip bird detection likelihood scoring on downloaded images
   -v, --verbose         Enable debug logging
+```
+
+---
+
+## Web Dashboard Authentication
+
+Anyone who can reach the dashboard can **view** status, sightings, photos and videos. Anything that changes state requires logging in.
+
+| Action | Guest | `user` | `admin` |
+| :--- | :---: | :---: | :---: |
+| View dashboard, sightings & media | ✅ | ✅ | ✅ |
+| Delete / restore media, Sync Now | | ✅ | ✅ |
+| Change own password, manage own passkeys & API keys | | ✅ | ✅ |
+| Add / delete users, set roles, reset passwords | | | ✅ |
+| Edit runtime settings (interval, templates, filters, detection) | | | ✅ |
+
+### First login
+
+On the first start with an empty user table, an `admin` account is created with a random password, which is printed once in the logs:
+
+```text
+[WARNING] No users found - created initial web dashboard administrator:
+[WARNING]     username: admin
+[WARNING]     password: 3qT...
+```
+
+With containers, use `podman logs birdbuddy-downloader` (or `docker logs ...`). Log in with **🔑 Log in** and change the password from **👤 Account**.
+
+### Passkeys
+
+Passkeys (WebAuthn) only work in a secure context and need a fixed hostname. Put the dashboard behind an HTTPS reverse proxy and set its public address:
+
+```bash
+WEB_PUBLIC_URL="https://birds.example.com"
+```
+
+When `WEB_PUBLIC_URL` is set, logged-in users can add passkeys from **👤 Account** and sign in with **Sign in with a passkey**. When it is not set, password login still works and passkey options are hidden. For local testing, `http://localhost:8080` also counts as a secure context.
+
+### API keys
+
+Each user can create personal API keys from **👤 Account**. A key acts with its owner's role and is shown only once:
+
+```bash
+curl -X POST -H "X-API-Key: bbd_xxxxxxxx_..." http://localhost:8080/api/sync
+curl -X POST -H "Authorization: Bearer bbd_xxxxxxxx_..." \
+     -H "Content-Type: application/json" -d '{"media_id": "..."}' \
+     http://localhost:8080/api/media/delete
+```
+
+> The shared `WEB_API_KEY` / `--web-api-key` option has been removed. If it is still set, a warning is logged and it is ignored. Create a personal API key instead.
+
+### Settings page
+
+Admins can edit runtime settings from **🛠️ Admin → Settings**. Saved values take effect immediately, are stored in the database, and override command-line/environment values on later starts. **Reset** returns a setting to its command-line/environment value. Bird Buddy credentials, paths and web host/port can only be set through the environment or CLI.
+
+### Locked out?
+
+Reset any user's password from the command line (this also signs out their sessions):
+
+```bash
+./venv/bin/python3 downloader.py --reset-password admin
+podman exec birdbuddy-downloader python downloader.py --reset-password admin
 ```
 
 ---
