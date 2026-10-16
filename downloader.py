@@ -1410,55 +1410,58 @@ class BirdBuddyDownloader:
                             f"Could not open postcard {postcard_id} ({e}). "
                             "Reading its media from the feed instead."
                         )
+                        # One boundary for the whole fallback: an error here
+                        # skips this postcard, not the rest of the sync.
                         try:
                             card = await self.postcard_from_feed(
                                 postcard_id, item_cursor
                             )
+                            if not card:
+                                logger.error(
+                                    f"Postcard {postcard_id} is no longer in the feed."
+                                )
+                                continue
+
+                            # Unopened, so the species is unknown.
+                            feeder_info = card.get("feeder") or {}
+                            feeder_id = feeder_info.get("id", "unknown_feeder")
+                            feeder_name = feeder_info.get("name", "Unknown Feeder")
+                            if (
+                                self.args.feeder_filter
+                                and self.args.feeder_filter.lower()
+                                not in feeder_name.lower()
+                            ):
+                                continue
+                            owner_name = self.feeders_map.get(feeder_id, {}).get(
+                                "ownerName", "Unknown Owner"
+                            )
+                            for m in card.get("medias") or []:
+                                if self.stop_requested:
+                                    break
+                                is_video = m.get("__typename") == "MediaVideo"
+                                status = await self.process_media_item(
+                                    m.get("id"),
+                                    "video" if is_video else "image",
+                                    m.get("contentUrl"),
+                                    m.get("createdAt"),
+                                    feeder_name,
+                                    feeder_id,
+                                    "Unrecognized Species",
+                                    owner_name,
+                                    postcard_id,
+                                )
+                                if status == "downloaded":
+                                    total_downloaded += 1
+                                elif status == "would_download":
+                                    total_would_download += 1
+                                elif status == "skipped":
+                                    total_skipped += 1
                         except Exception as e:
+                            if self.stop_requested:
+                                break
                             logger.error(
                                 f"Error processing postcard {postcard_id}: {e}"
                             )
-                            continue
-                        if not card:
-                            logger.error(
-                                f"Postcard {postcard_id} is no longer in the feed."
-                            )
-                            continue
-
-                        # Unopened, so the species is unknown.
-                        feeder_info = card.get("feeder") or {}
-                        feeder_id = feeder_info.get("id", "unknown_feeder")
-                        feeder_name = feeder_info.get("name", "Unknown Feeder")
-                        if (
-                            self.args.feeder_filter
-                            and self.args.feeder_filter.lower()
-                            not in feeder_name.lower()
-                        ):
-                            continue
-                        owner_name = self.feeders_map.get(feeder_id, {}).get(
-                            "ownerName", "Unknown Owner"
-                        )
-                        for m in card.get("medias") or []:
-                            if self.stop_requested:
-                                break
-                            is_video = m.get("__typename") == "MediaVideo"
-                            status = await self.process_media_item(
-                                m.get("id"),
-                                "video" if is_video else "image",
-                                m.get("contentUrl"),
-                                m.get("createdAt"),
-                                feeder_name,
-                                feeder_id,
-                                "Unrecognized Species",
-                                owner_name,
-                                postcard_id,
-                            )
-                            if status == "downloaded":
-                                total_downloaded += 1
-                            elif status == "would_download":
-                                total_would_download += 1
-                            elif status == "skipped":
-                                total_skipped += 1
 
                 elif node_type in [
                     "FeedItemCollectedPostcard",

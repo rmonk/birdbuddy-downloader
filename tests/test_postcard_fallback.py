@@ -63,9 +63,34 @@ ITEM_AFTER = {
 }
 
 
+def postcard(postcard_id, created_at, medias):
+    return {
+        "__typename": "FeedItemNewPostcard",
+        "id": postcard_id,
+        "createdAt": created_at,
+        "feeder": {"__typename": "FeederForMember", "id": "f1", "name": "Feeder"},
+        "medias": medias,
+    }
+
+
+def video(media_id):
+    return {
+        "__typename": "MediaVideo",
+        "id": media_id,
+        "createdAt": "2026-10-15T18:58:30.000Z",
+        "contentUrl": f"https://media.example/{media_id}.mp4",
+    }
+
+
 class FakeBirdBuddy:
+    """No postcard opens; the feed lists their media item by item."""
+
+    def __init__(self, feed=FEED, item_after=ITEM_AFTER):
+        self._feed = feed
+        self._item_after = item_after
+
     async def feed(self, first=50, after=None):
-        return FEED
+        return self._feed
 
     async def sighting_from_postcard(self, postcard_id):
         raise GraphqlError(
@@ -73,11 +98,13 @@ class FakeBirdBuddy:
         )
 
     async def _make_request(self, query, variables=None, **kwargs):
-        node = ITEM_AFTER[variables["after"]]
+        node = self._item_after[variables["after"]]
         return {"me": {"feed": {"edges": [{"node": node}]}}}
 
 
 async def fake_download(url, dest_path, stop_checker=None):
+    if "unwritable" in url:
+        raise PermissionError(f"cannot create {os.path.dirname(dest_path)}")
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     with open(dest_path, "wb") as f:
         f.write(b"media")
@@ -121,6 +148,27 @@ class PostcardFallbackTest(unittest.TestCase):
             self.conn.execute("SELECT media_id, media_type FROM downloaded_media")
         )
         self.assertEqual(rows, {"img-1": "image", "vid-1": "video"})
+
+    def test_failed_fallback_download_does_not_stop_the_sync(self):
+        first = postcard("pc-a", "2026-10-15T19:00:00.000Z", [video("unwritable")])
+        second = postcard("pc-b", "2026-10-15T18:00:00.000Z", [video("vid-b")])
+        feed = Feed(
+            {
+                "edges": [
+                    {"cursor": "cursor-a", "node": {**first, "medias": None}},
+                    {"cursor": "cursor-b", "node": {**second, "medias": None}},
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+        )
+        self.dl.bb = FakeBirdBuddy(feed, {None: first, "cursor-a": second})
+
+        with mock.patch.object(downloader, "download_file", fake_download):
+            downloaded = asyncio.run(self.dl.sync_feed())
+
+        self.assertEqual(downloaded, 1)
+        folder = os.path.join(self.media_dir, "Unrecognized Species")
+        self.assertEqual(os.listdir(folder), ["vid-b.mp4"])
 
 
 if __name__ == "__main__":
