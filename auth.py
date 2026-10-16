@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     webauthn_user_id BLOB NOT NULL,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     password_changed_at TEXT
 );
@@ -111,8 +112,14 @@ def _now_iso() -> str:
     return _now().isoformat()
 
 
-def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def _hash_token(token: str) -> str:
+    """Hash a server-generated random secret (session token or API key) for storage.
+
+    These are 256-bit values from `secrets`, so a fast digest is appropriate: there is
+    nothing to brute-force, and a slow KDF would add latency to every request. User
+    passwords never come through here; they use scrypt in `hash_password()`.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _error(message: str, status: int) -> web.Response:
@@ -132,6 +139,11 @@ def init_auth_db(conn: sqlite3.Connection):
     conn.execute("PRAGMA foreign_keys=ON;")
     with conn:
         conn.executescript(AUTH_SCHEMA)
+        user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "must_change_password" not in user_cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
+            )
     purge_expired_sessions(conn)
 
 
@@ -184,29 +196,49 @@ def validate_new_password(password) -> str | None:
 # ------------------------------------------------------------------------------
 
 
+# Queries feeding this select: id, username, role, must_change_password, ...
 def _user_row_to_dict(row) -> dict:
-    return {"id": row[0], "username": row[1], "role": row[2]}
+    return {
+        "id": row[0],
+        "username": row[1],
+        "role": row[2],
+        "must_change_password": bool(row[3]),
+    }
 
 
 def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT id, username, role FROM users WHERE id = ?", (user_id,)
+        "SELECT id, username, role, must_change_password FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    return _user_row_to_dict(row) if row else None
+
+
+def get_user_by_username(conn: sqlite3.Connection, username: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id, username, role, must_change_password FROM users WHERE username = ?",
+        (username,),
     ).fetchone()
     return _user_row_to_dict(row) if row else None
 
 
 def create_user(
-    conn: sqlite3.Connection, username: str, password: str, role: str = "user"
+    conn: sqlite3.Connection,
+    username: str,
+    password: str,
+    role: str = "user",
+    must_change_password: bool = False,
 ) -> int:
     with conn:
         cur = conn.execute(
-            "INSERT INTO users (username, password_hash, role, webauthn_user_id, created_at, password_changed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (username, password_hash, role, webauthn_user_id, must_change_password, "
+            "created_at, password_changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 username,
                 hash_password(password),
                 role,
                 secrets.token_bytes(32),
+                int(must_change_password),
                 _now_iso(),
                 _now_iso(),
             ),
@@ -214,11 +246,20 @@ def create_user(
     return cur.lastrowid
 
 
-def set_user_password(conn: sqlite3.Connection, user_id: int, password: str):
+def set_user_password(
+    conn: sqlite3.Connection,
+    user_id: int,
+    password: str,
+    must_change_password: bool = False,
+):
+    """Set a password. Pass must_change_password=True for any password the user did
+    not choose themselves (generated, logged, or set by an admin) so it works only
+    until their first login."""
     with conn:
         conn.execute(
-            "UPDATE users SET password_hash = ?, password_changed_at = ? WHERE id = ?",
-            (hash_password(password), _now_iso(), user_id),
+            "UPDATE users SET password_hash = ?, password_changed_at = ?, must_change_password = ? "
+            "WHERE id = ?",
+            (hash_password(password), _now_iso(), int(must_change_password), user_id),
         )
 
 
@@ -231,27 +272,35 @@ def ensure_initial_admin(conn: sqlite3.Connection) -> str | None:
     if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
         return None
     password = generate_password()
-    create_user(conn, "admin", password, role="admin")
+    create_user(conn, "admin", password, role="admin", must_change_password=True)
     banner = "=" * 72
     logger.warning(banner)
     logger.warning("No users found - created initial web dashboard administrator:")
     logger.warning("    username: admin")
     logger.warning(f"    password: {password}")
-    logger.warning("Log in and change this password from the Account menu.")
+    logger.warning(
+        "This password is single-use: you must choose a new one when you first log in."
+    )
     logger.warning(banner)
     return password
 
 
-def reset_user_password(conn: sqlite3.Connection, username: str) -> str | None:
-    """Assign a new random password to a user and revoke their sessions."""
-    row = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-    if not row:
+def reset_user_password(
+    conn: sqlite3.Connection, username: str, password: str | None = None
+) -> str | None:
+    """Set a user's password and revoke their sessions.
+
+    With no password, a random one is generated and returned; it must be changed at
+    next login. A password chosen by the operator is not flagged.
+    """
+    user = get_user_by_username(conn, username)
+    if not user:
         return None
-    password = generate_password()
-    set_user_password(conn, row[0], password)
-    delete_user_sessions(conn, row[0])
+    generated = password is None
+    if generated:
+        password = generate_password()
+    set_user_password(conn, user["id"], password, must_change_password=generated)
+    delete_user_sessions(conn, user["id"])
     return password
 
 
@@ -267,7 +316,7 @@ def create_session(conn: sqlite3.Connection, user_id: int) -> str:
         conn.execute(
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
             (
-                _sha256(token),
+                _hash_token(token),
                 user_id,
                 now.isoformat(),
                 (now + SESSION_TTL).isoformat(),
@@ -278,20 +327,21 @@ def create_session(conn: sqlite3.Connection, user_id: int) -> str:
 
 
 def get_session_user(conn: sqlite3.Connection, token: str) -> dict | None:
-    token_hash = _sha256(token)
+    token_hash = _hash_token(token)
     row = conn.execute(
-        "SELECT u.id, u.username, u.role, s.expires_at, s.last_seen_at FROM sessions s "
+        "SELECT u.id, u.username, u.role, u.must_change_password, s.expires_at, s.last_seen_at "
+        "FROM sessions s "
         "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?",
         (token_hash,),
     ).fetchone()
     if not row:
         return None
     now = _now()
-    if datetime.fromisoformat(row[3]) <= now:
+    if datetime.fromisoformat(row[4]) <= now:
         delete_session(conn, token)
         return None
     # Sliding expiry, written at most once a minute
-    last_seen = datetime.fromisoformat(row[4]) if row[4] else None
+    last_seen = datetime.fromisoformat(row[5]) if row[5] else None
     if not last_seen or (now - last_seen).total_seconds() > 60:
         with conn:
             conn.execute(
@@ -303,7 +353,7 @@ def get_session_user(conn: sqlite3.Connection, token: str) -> dict | None:
 
 def delete_session(conn: sqlite3.Connection, token: str):
     with conn:
-        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_sha256(token),))
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
 
 
 def delete_user_sessions(
@@ -313,7 +363,7 @@ def delete_user_sessions(
         if keep_token:
             conn.execute(
                 "DELETE FROM sessions WHERE user_id = ? AND token_hash != ?",
-                (user_id, _sha256(keep_token)),
+                (user_id, _hash_token(keep_token)),
             )
         else:
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
@@ -335,22 +385,23 @@ def create_api_key(conn: sqlite3.Connection, user_id: int, name: str) -> dict:
     with conn:
         cur = conn.execute(
             "INSERT INTO api_keys (user_id, name, prefix, key_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, name, prefix, _sha256(key), _now_iso()),
+            (user_id, name, prefix, _hash_token(key), _now_iso()),
         )
     return {"id": cur.lastrowid, "name": name, "prefix": prefix, "key": key}
 
 
 def resolve_api_key(conn: sqlite3.Connection, key: str) -> dict | None:
     row = conn.execute(
-        "SELECT u.id, u.username, u.role, k.id FROM api_keys k JOIN users u ON u.id = k.user_id "
+        "SELECT u.id, u.username, u.role, u.must_change_password, k.id "
+        "FROM api_keys k JOIN users u ON u.id = k.user_id "
         "WHERE k.key_hash = ?",
-        (_sha256(key),),
+        (_hash_token(key),),
     ).fetchone()
     if not row:
         return None
     with conn:
         conn.execute(
-            "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (_now_iso(), row[3])
+            "UPDATE api_keys SET last_used_at = ? WHERE id = ?", (_now_iso(), row[4])
         )
     return _user_row_to_dict(row)
 
@@ -478,8 +529,13 @@ async def auth_middleware(request: web.Request, handler):
     return await handler(request)
 
 
-def require_role(role: str):
-    """Decorator for aiohttp handlers: 401 when anonymous, 403 when role is insufficient."""
+def require_role(role: str, allow_pending_password_change: bool = False):
+    """Decorator for aiohttp handlers: 401 when anonymous, 403 when role is insufficient.
+
+    Sessions whose password must be changed (generated or admin-set password) are
+    refused with code "password_change_required" unless the handler opts out.
+    API keys are independent credentials and are not affected.
+    """
 
     def decorator(handler):
         @functools.wraps(handler)
@@ -487,6 +543,19 @@ def require_role(role: str):
             user = request.get("user")
             if not user:
                 return _error("Login required", 401)
+            if (
+                user.get("must_change_password")
+                and request.get("auth_via") == "session"
+                and not allow_pending_password_change
+            ):
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "code": "password_change_required",
+                        "message": "You must change your password before continuing.",
+                    },
+                    status=403,
+                )
             if role == "admin" and user["role"] != "admin":
                 return _error("Admin role required", 403)
             return await handler(request)
@@ -550,10 +619,10 @@ async def handle_login(request: web.Request) -> web.Response:
         return _error("Too many failed attempts. Try again in a few minutes.", 429)
 
     row = conn.execute(
-        "SELECT id, username, role, password_hash FROM users WHERE username = ?",
+        "SELECT id, username, role, must_change_password, password_hash FROM users WHERE username = ?",
         (username,),
     ).fetchone()
-    if not verify_password(password, row[3] if row else _DUMMY_HASH) or not row:
+    if not verify_password(password, row[4] if row else _DUMMY_HASH) or not row:
         throttle.record_failure(*keys)
         logger.warning(
             f"Failed web login for '{username}' from {request.remote or 'unknown'}"
@@ -691,7 +760,7 @@ async def handle_passkey_login_verify(request: web.Request) -> web.Response:
             (verified.new_sign_count, _now_iso(), row[0]),
         )
     throttle.reset(ip_key)
-    user = {"id": row[3], "username": row[4], "role": row[5]}
+    user = get_user_by_id(conn, row[3])
     logger.info(f"User '{user['username']}' logged in to web dashboard with a passkey")
     return _login_response(request, conn, user)
 
@@ -837,7 +906,7 @@ async def handle_passkey_delete(request: web.Request) -> web.Response:
 # ------------------------------------------------------------------------------
 
 
-@require_role("user")
+@require_role("user", allow_pending_password_change=True)
 async def handle_change_password(request: web.Request) -> web.Response:
     conn: sqlite3.Connection = request.app["auth_conn"]
     data = await _read_json(request)
@@ -854,6 +923,8 @@ async def handle_change_password(request: web.Request) -> web.Response:
     problem = validate_new_password(new)
     if problem:
         return _error(problem, 400)
+    if new == current:
+        return _error("New password must be different from the current one", 400)
     set_user_password(conn, user["id"], new)
     delete_user_sessions(
         conn, user["id"], keep_token=request.cookies.get(SESSION_COOKIE)
@@ -923,7 +994,8 @@ async def handle_users_list(request: web.Request) -> web.Response:
     rows = conn.execute(
         "SELECT u.id, u.username, u.role, u.created_at, "
         "(SELECT COUNT(*) FROM passkeys p WHERE p.user_id = u.id), "
-        "(SELECT COUNT(*) FROM api_keys k WHERE k.user_id = u.id) "
+        "(SELECT COUNT(*) FROM api_keys k WHERE k.user_id = u.id), "
+        "u.must_change_password "
         "FROM users u ORDER BY u.username"
     ).fetchall()
     return web.json_response(
@@ -936,6 +1008,7 @@ async def handle_users_list(request: web.Request) -> web.Response:
                     "created_at": r[3],
                     "passkeys": r[4],
                     "api_keys": r[5],
+                    "must_change_password": bool(r[6]),
                 }
                 for r in rows
             ]
@@ -967,16 +1040,13 @@ async def handle_user_create(request: web.Request) -> web.Response:
         if problem:
             return _error(problem, 400)
     try:
-        user_id = create_user(conn, username, password, role)
+        user_id = create_user(conn, username, password, role, must_change_password=True)
     except sqlite3.IntegrityError:
         return _error("A user with that name already exists", 409)
     logger.info(
         f"Admin '{request['user']['username']}' created {role} account '{username}'"
     )
-    result = {
-        "status": "ok",
-        "user": {"id": user_id, "username": username, "role": role},
-    }
+    result = {"status": "ok", "user": get_user_by_id(conn, user_id)}
     if generated:
         result["password"] = password
     return web.json_response(result)
@@ -1017,7 +1087,7 @@ async def handle_user_update(request: web.Request) -> web.Response:
         )
     if data.get("reset_password") or password is not None:
         new_password = password if password is not None else generate_password()
-        set_user_password(conn, user_id, new_password)
+        set_user_password(conn, user_id, new_password, must_change_password=True)
         delete_user_sessions(conn, user_id)
         if password is None:
             result["password"] = new_password

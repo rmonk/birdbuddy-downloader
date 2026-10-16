@@ -27,6 +27,7 @@ Features:
 
 import argparse
 import asyncio
+import getpass
 import io
 import json
 import logging
@@ -1808,6 +1809,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .setting-row .muted, .setting-row .field-error { grid-column: 1 / -1; }
     .input.input-invalid, .input.input-invalid:focus { border-color: #f87171; outline: 2px solid #f87171; outline-offset: -1px; }
     .field-error { color: #f87171; font-size: 0.82rem; }
+    .notice { background: var(--gold-bg); border: 1px solid rgba(251, 191, 36, 0.5); color: var(--gold); border-radius: 6px; padding: 10px 12px; font-size: 0.88rem; margin-bottom: 6px; }
   </style>
 </head>
 <body class="guest">
@@ -1942,6 +1944,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <div class="dialog" onclick="event.stopPropagation()">
       <button class="dialog-close" onclick="closeDialog('accountModal')">&times;</button>
       <h2>Account: <span id="accountName"></span></h2>
+      <div class="notice" id="pwRequiredNotice" style="display:none;">
+        🔒 Your password was generated or set by an administrator. Choose a new password to continue.
+      </div>
 
       <h3>Change password</h3>
       <form onsubmit="changePassword(event)">
@@ -1953,6 +1958,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </form>
       <div class="form-msg" id="pwMsg"></div>
 
+      <div id="accountExtras">
       <h3>Passkeys</h3>
       <div class="passkey-only">
         <div class="form-inline">
@@ -1973,6 +1979,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <div id="newApiKey"></div>
       <div id="apiKeyList"></div>
       <div class="form-msg" id="apiKeyMsg"></div>
+      </div>
     </div>
   </div>
 
@@ -2370,6 +2377,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         await refreshAuth();
         openLogin("Please log in to continue.");
       }
+      if (resp.status === 403 && data.code === "password_change_required") {
+        await refreshAuth();
+      }
       if (!resp.ok) {
         const err = new Error(data.message || resp.statusText);
         err.status = resp.status;
@@ -2397,6 +2407,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       document.body.classList.toggle("is-admin", !!currentUser && currentUser.role === "admin");
       document.body.classList.toggle("passkeys-on", passkeysEnabled);
       document.getElementById("passkeysDisabledNote").style.display = passkeysEnabled ? "none" : "";
+      if (currentUser && currentUser.must_change_password) openAccount();
       document.getElementById("accountBtn").innerHTML = currentUser
         ? `👤 ${escapeHtml(currentUser.username)} <span class="role">(${escapeHtml(currentUser.role)})</span>`
         : "👤 Account";
@@ -2494,11 +2505,25 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     // --- Account dialog ---
+    function passwordChangePending() {
+      return !!(currentUser && currentUser.must_change_password);
+    }
+
     async function openAccount() {
+      const pending = passwordChangePending();
+      const alreadyOpen = document.getElementById("accountModal").classList.contains("active");
       document.getElementById("accountName").textContent = currentUser ? currentUser.username : "";
+      document.getElementById("pwRequiredNotice").style.display = pending ? "" : "none";
+      document.getElementById("accountExtras").style.display = pending ? "none" : "";
+      if (pending) ["adminModal", "loginModal"].forEach(id => closeDialog(id));
+      if (alreadyOpen && pending) return;
       document.getElementById("newApiKey").innerHTML = "";
       ["pwMsg", "passkeyMsg", "apiKeyMsg"].forEach(id => setMsg(id, ""));
       openDialog("accountModal");
+      if (pending) {
+        document.getElementById("pwCurrent").focus();
+        return;
+      }
       await Promise.all([loadPasskeys(), loadApiKeys()]);
     }
 
@@ -2511,6 +2536,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         });
         document.getElementById("pwCurrent").value = "";
         document.getElementById("pwNew").value = "";
+        const wasPending = passwordChangePending();
+        if (wasPending) {
+          await refreshAuth();
+          document.getElementById("pwRequiredNotice").style.display = "none";
+          document.getElementById("accountExtras").style.display = "";
+          await Promise.all([loadPasskeys(), loadApiKeys(), loadStatus()]);
+        }
         setMsg("pwMsg", "Password updated. Other sessions were signed out.", true);
       } catch (err) {
         setMsg("pwMsg", err.message, false);
@@ -2676,7 +2708,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           data.users.map(u => {
             const self = currentUser && u.id === currentUser.id;
             return `<tr>
-              <td>${escapeHtml(u.username)}${self ? ' <span class="muted">(you)</span>' : ""}</td>
+              <td>${escapeHtml(u.username)}${self ? ' <span class="muted">(you)</span>' : ""}
+                ${u.must_change_password ? '<div class="muted">password change pending</div>' : ""}</td>
               <td><select class="input" data-id="${u.id}" onchange="setUserRole(this)">
                 <option value="user"${u.role === "user" ? " selected" : ""}>user</option>
                 <option value="admin"${u.role === "admin" ? " selected" : ""}>admin</option>
@@ -2704,9 +2737,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         document.getElementById("newUsername").value = "";
         document.getElementById("newUserPassword").value = "";
         document.getElementById("userSecret").innerHTML = data.password
-          ? secretBox(`Generated password for ${username}. It will not be shown again.`, data.password)
+          ? secretBox(`Generated password for ${username}. It will not be shown again and must be changed at first login.`, data.password)
           : "";
-        setMsg("userMsg", `User ${username} created.`, true);
+        setMsg("userMsg", `User ${username} created. They must choose a new password at first login.`, true);
         await loadUsers();
       } catch (err) {
         setMsg("userMsg", err.message, false);
@@ -2732,7 +2765,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       if (!confirm(`Reset the password for ${btn.dataset.name}? Their existing sessions will be signed out.`)) return;
       try {
         const data = await api("PATCH", "/api/admin/users/" + btn.dataset.id, { reset_password: true });
-        document.getElementById("userSecret").innerHTML = secretBox(`New password for ${btn.dataset.name}. It will not be shown again.`, data.password);
+        document.getElementById("userSecret").innerHTML = secretBox(`New single-use password for ${btn.dataset.name}. It will not be shown again.`, data.password);
+        await loadUsers();
         if (currentUser && String(currentUser.id) === btn.dataset.id) await refreshAuth();
       } catch (err) {
         setMsg("userMsg", err.message, false);
@@ -3537,8 +3571,11 @@ def parse_args():
     )
     parser.add_argument(
         "--reset-password",
+        dest="reset_password_for",
         metavar="USERNAME",
-        help="Set a new random web dashboard password for USERNAME, print it, and exit",
+        help="Reset the web dashboard password for USERNAME and exit. In an interactive "
+        "terminal you are prompted for the new password; otherwise a single-use random "
+        "password is generated and printed",
     )
     parser.add_argument(
         "--no-web",
@@ -3573,6 +3610,39 @@ def parse_args():
     return parser.parse_args()
 
 
+def reset_password_cli(conn: sqlite3.Connection, username: str) -> int:
+    """Handle --reset-password. Returns a process exit code."""
+    try:
+        if not auth.get_user_by_username(conn, username):
+            print(f"Error: no web dashboard user named '{username}'.", file=sys.stderr)
+            return 1
+
+        if sys.stdin.isatty():
+            # Interactive: the operator chooses the password and nothing is echoed or printed
+            new_password = getpass.getpass(f"New password for '{username}': ")
+            problem = auth.validate_new_password(new_password)
+            if problem:
+                print(f"Error: {problem}.", file=sys.stderr)
+                return 1
+            if getpass.getpass("Repeat new password: ") != new_password:
+                print("Error: passwords do not match.", file=sys.stderr)
+                return 1
+            auth.reset_user_password(conn, username, new_password)
+            print(
+                f"Password for '{username}' updated. Existing sessions were signed out."
+            )
+            return 0
+
+        # Non-interactive (e.g. `podman exec` without -it): generate a single-use password
+        generated = auth.reset_user_password(conn, username)
+        print(
+            f"Single-use password for '{username}' (must be changed at next login): {generated}"
+        )
+        return 0
+    finally:
+        conn.close()
+
+
 async def main():
     args = parse_args()
 
@@ -3581,14 +3651,8 @@ async def main():
 
     conn = init_db(args.db_path)
 
-    if args.reset_password:
-        new_password = auth.reset_user_password(conn, args.reset_password)
-        conn.close()
-        if not new_password:
-            print(f"Error: no web dashboard user named '{args.reset_password}'.")
-            sys.exit(1)
-        print(f"New web dashboard password for '{args.reset_password}': {new_password}")
-        return
+    if args.reset_password_for:
+        sys.exit(reset_password_cli(conn, args.reset_password_for))
 
     auth.apply_settings_overrides(args, conn)
     downloader = BirdBuddyDownloader(args, conn)
@@ -3709,5 +3773,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         sys.exit(0)

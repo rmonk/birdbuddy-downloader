@@ -108,7 +108,9 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 ### Web Authentication (`auth.py`)
 - `auth_middleware` resolves `request["user"]` from the `bbd_session` cookie, else `X-API-Key` / `Authorization: Bearer`. Non-GET requests not authenticated by API key must pass an Origin / `Sec-Fetch-Site` same-origin check (CSRF).
 - Guard handlers with `@auth.require_role("user")` or `@auth.require_role("admin")` (401 anonymous, 403 insufficient role). Any new mutating or config endpoint **must** use one of these.
-- `ensure_initial_admin()` creates `admin` with a random password logged at WARNING when the users table is empty (web mode only). `--reset-password USERNAME` is the CLI recovery path.
+- `ensure_initial_admin()` creates `admin` with a random password logged at WARNING when the users table is empty (web mode only). `--reset-password USERNAME` is the CLI recovery path (prompts via `getpass` on a TTY; otherwise prints a generated password).
+- `users.must_change_password` marks any password the user did not choose (bootstrap, admin-created/reset, CLI-generated). While set, `require_role` refuses session requests with 403 `code: "password_change_required"` except handlers declared with `allow_pending_password_change=True` (change password). API keys are not affected. Always pass `must_change_password=True` to `create_user`/`set_user_password` for such passwords.
+- `_hash_token()` (SHA-256) is only for server-generated 256-bit secrets (session tokens, API keys). Never use it for passwords; those use scrypt via `hash_password()`.
 - Passkeys require `WEB_PUBLIC_URL` (RP ID = hostname, expected origin = scheme+host). Challenges are single-use, kept in memory for 5 minutes.
 - `SETTINGS_SPEC` whitelists web-editable settings with parsers/validators. Never add credentials, paths or bind addresses to it.
 - Endpoints: `/api/auth/{me,login,logout}`, `/api/auth/passkey/login/{options,verify}`, `/api/account/{password,passkeys,api-keys}`, `/api/admin/{users,settings}`.
@@ -157,7 +159,7 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 | `--web-port` | `8080` | Port for embedded web status dashboard (or `WEB_PORT` env var) |
 | `--web-host` | `0.0.0.0` | Host to bind embedded web dashboard (or `WEB_HOST` env var) |
 | `--web-public-url` | `None` | Public HTTPS URL (or `WEB_PUBLIC_URL`); enables passkeys and Secure cookies |
-| `--reset-password` | `None` | Set a new random web password for USERNAME, print it, and exit |
+| `--reset-password` | `None` | Reset USERNAME's web password and exit (prompts on a TTY, else prints a single-use password) |
 | `--no-web` | `False` | Disable embedded web status dashboard |
 | `-v`, `--verbose` | `False` | Enable debug logging |
 
