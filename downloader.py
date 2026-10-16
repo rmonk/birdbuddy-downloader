@@ -3571,7 +3571,7 @@ def parse_args():
     )
     parser.add_argument(
         "--reset-password",
-        dest="reset_password_for",
+        dest="reset_web_user",
         metavar="USERNAME",
         help="Reset the web dashboard password for USERNAME and exit. In an interactive "
         "terminal you are prompted for the new password; otherwise a single-use random "
@@ -3620,9 +3620,11 @@ def reset_password_cli(conn: sqlite3.Connection, username: str) -> int:
         if sys.stdin.isatty():
             # Interactive: the operator chooses the password and nothing is echoed or printed
             new_password = getpass.getpass(f"New password for '{username}': ")
-            problem = auth.validate_new_password(new_password)
-            if problem:
-                print(f"Error: {problem}.", file=sys.stderr)
+            if auth.validate_new_password(new_password):
+                print(
+                    f"Error: the password must be at least {auth.MIN_PASSWORD_LENGTH} characters.",
+                    file=sys.stderr,
+                )
                 return 1
             if getpass.getpass("Repeat new password: ") != new_password:
                 print("Error: passwords do not match.", file=sys.stderr)
@@ -3651,8 +3653,8 @@ async def main():
 
     conn = init_db(args.db_path)
 
-    if args.reset_password_for:
-        sys.exit(reset_password_cli(conn, args.reset_password_for))
+    if args.reset_web_user:
+        sys.exit(reset_password_cli(conn, args.reset_web_user))
 
     auth.apply_settings_overrides(args, conn)
     downloader = BirdBuddyDownloader(args, conn)
