@@ -27,6 +27,7 @@ Features:
 
 import argparse
 import asyncio
+import getpass
 import io
 import json
 import logging
@@ -47,6 +48,8 @@ from dotenv import load_dotenv
 
 import piexif
 from PIL import Image
+
+import auth
 
 try:
     from birdbuddy.client import BirdBuddy
@@ -144,6 +147,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_is_deleted ON downloaded_media(is_deleted)"
         )
 
+    auth.init_auth_db(conn)
     return conn
 
 
@@ -1766,9 +1770,49 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .feeder-head { font-weight: 600; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
     .feeder-stat { font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px; display: flex; justify-content: space-between; }
     .feeder-stat span:last-child { color: var(--text-primary); font-weight: 500; }
+
+    /* Auth visibility */
+    body.guest .auth-only { display: none !important; }
+    body:not(.is-admin) .admin-only { display: none !important; }
+    body:not(.guest) .guest-only { display: none !important; }
+    body:not(.passkeys-on) .passkey-only { display: none !important; }
+    #accountBtn .role { font-weight: 400; color: var(--text-secondary); }
+
+    /* Dialogs */
+    .dialog { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 10px; width: min(640px, calc(100vw - 32px)); max-height: 88vh; overflow-y: auto; padding: 22px; position: relative; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+    .dialog.narrow { width: min(380px, calc(100vw - 32px)); }
+    .dialog h2 { font-size: 1.2rem; margin-bottom: 14px; }
+    .dialog h3 { font-size: 0.95rem; margin: 20px 0 10px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; }
+    .dialog .dialog-close { position: absolute; top: 10px; right: 14px; font-size: 1.5rem; color: var(--text-secondary); cursor: pointer; border: none; background: none; }
+    .form-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+    .form-row label { font-size: 0.8rem; color: var(--text-secondary); }
+    .form-inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+    .input { background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 0.9rem; min-width: 0; }
+    .input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .form-inline .input { flex: 1 1 160px; }
+    .form-msg { font-size: 0.85rem; min-height: 1.2em; margin-top: 6px; }
+    .form-msg.error { color: #f87171; }
+    .form-msg.ok { color: var(--accent); }
+    .divider { display: flex; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 0.8rem; margin: 14px 0; }
+    .divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+    .btn-block { width: 100%; justify-content: center; }
+    .btn-small { padding: 4px 10px; font-size: 0.78rem; }
+    .list-table { width: 100%; font-size: 0.85rem; }
+    .list-table td, .list-table th { padding: 8px 10px; }
+    .muted { color: var(--text-secondary); font-size: 0.8rem; }
+    .secret-box { background: var(--bg-primary); border: 1px dashed var(--gold); border-radius: 6px; padding: 10px; margin: 8px 0; font-family: monospace; font-size: 0.85rem; word-break: break-all; display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+    .tabs { display: flex; gap: 6px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .tab { background: none; border: none; color: var(--text-secondary); padding: 8px 12px; cursor: pointer; font-weight: 600; border-bottom: 2px solid transparent; }
+    .tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
+    .setting-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px 0; border-bottom: 1px solid rgba(71, 85, 105, 0.5); align-items: center; }
+    .setting-row .input { width: 100%; }
+    .setting-row .muted, .setting-row .field-error { grid-column: 1 / -1; }
+    .input.input-invalid, .input.input-invalid:focus { border-color: #f87171; outline: 2px solid #f87171; outline-offset: -1px; }
+    .field-error { color: #f87171; font-size: 0.82rem; }
+    .notice { background: var(--gold-bg); border: 1px solid rgba(251, 191, 36, 0.5); color: var(--gold); border-radius: 6px; padding: 10px 12px; font-size: 0.88rem; margin-bottom: 6px; }
   </style>
 </head>
-<body>
+<body class="guest">
   <div class="container">
     <header>
       <div class="header-title">
@@ -1782,9 +1826,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <label class="auto-refresh">
           <input type="checkbox" id="autoRefreshToggle" checked> Auto-refresh (10s)
         </label>
-        <button class="btn" id="syncBtn" onclick="triggerSync()">
+        <button class="btn auth-only" id="syncBtn" onclick="triggerSync()">
           <span>⚡ Sync Now</span>
         </button>
+        <button class="btn btn-secondary auth-only" id="accountBtn" onclick="openAccount()" title="Account settings">👤 Account</button>
+        <button class="btn btn-secondary admin-only" onclick="openAdmin()">🛠️ Admin</button>
+        <button class="btn btn-secondary auth-only" onclick="logout()">Log out</button>
+        <button class="btn btn-secondary guest-only" id="loginBtn" onclick="openLogin()">🔑 Log in</button>
       </div>
     </header>
 
@@ -1864,6 +1912,112 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <div class="modal-content" onclick="event.stopPropagation()">
       <div id="modalMediaContainer"></div>
       <div class="modal-caption" id="modalCaption"></div>
+    </div>
+  </div>
+
+  <!-- Login Dialog -->
+  <div id="loginModal" class="modal" onclick="closeDialog('loginModal', event)">
+    <div class="dialog narrow" onclick="event.stopPropagation()">
+      <button class="dialog-close" onclick="closeDialog('loginModal')">&times;</button>
+      <h2>Log in</h2>
+      <form onsubmit="passwordLogin(event)">
+        <div class="form-row">
+          <label for="loginUsername">Username</label>
+          <input class="input" id="loginUsername" autocomplete="username webauthn" required>
+        </div>
+        <div class="form-row">
+          <label for="loginPassword">Password</label>
+          <input class="input" id="loginPassword" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-block" type="submit">Log in</button>
+      </form>
+      <div class="passkey-only">
+        <div class="divider">or</div>
+        <button class="btn btn-secondary btn-block" onclick="passkeyLogin()">🔐 Sign in with a passkey</button>
+      </div>
+      <div class="form-msg" id="loginMsg"></div>
+    </div>
+  </div>
+
+  <!-- Account Dialog -->
+  <div id="accountModal" class="modal" onclick="closeDialog('accountModal', event)">
+    <div class="dialog" onclick="event.stopPropagation()">
+      <button class="dialog-close" onclick="closeDialog('accountModal')">&times;</button>
+      <h2>Account: <span id="accountName"></span></h2>
+      <div class="notice" id="pwRequiredNotice" style="display:none;">
+        🔒 Your password was generated or set by an administrator. Choose a new password to continue.
+      </div>
+
+      <h3>Change password</h3>
+      <form onsubmit="changePassword(event)">
+        <div class="form-inline">
+          <input class="input" id="pwCurrent" type="password" placeholder="Current password" autocomplete="current-password" required>
+          <input class="input" id="pwNew" type="password" placeholder="New password (8+ characters)" autocomplete="new-password" minlength="8" required>
+          <button class="btn" type="submit">Update</button>
+        </div>
+      </form>
+      <div class="form-msg" id="pwMsg"></div>
+
+      <div id="accountExtras">
+      <h3>Passkeys</h3>
+      <div class="passkey-only">
+        <div class="form-inline">
+          <input class="input" id="passkeyName" placeholder="Passkey name (e.g. Laptop)" maxlength="64">
+          <button class="btn" onclick="addPasskey()">➕ Add passkey</button>
+        </div>
+        <div id="passkeyList"></div>
+      </div>
+      <div class="muted" id="passkeysDisabledNote">Passkeys are disabled. The administrator must set WEB_PUBLIC_URL to the dashboard's HTTPS address.</div>
+      <div class="form-msg" id="passkeyMsg"></div>
+
+      <h3>API keys</h3>
+      <div class="muted" style="margin-bottom:8px;">Use with the <code>X-API-Key</code> header or <code>Authorization: Bearer</code>. Keys act with your role.</div>
+      <div class="form-inline">
+        <input class="input" id="apiKeyName" placeholder="Key name (e.g. backup script)" maxlength="64">
+        <button class="btn" onclick="createApiKey()">➕ Create key</button>
+      </div>
+      <div id="newApiKey"></div>
+      <div id="apiKeyList"></div>
+      <div class="form-msg" id="apiKeyMsg"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin Dialog -->
+  <div id="adminModal" class="modal" onclick="closeDialog('adminModal', event)">
+    <div class="dialog" onclick="event.stopPropagation()">
+      <button class="dialog-close" onclick="closeDialog('adminModal')">&times;</button>
+      <h2>Administration</h2>
+      <div class="tabs">
+        <button class="tab active" id="tabUsers" onclick="showAdminTab('users')">Users</button>
+        <button class="tab" id="tabSettings" onclick="showAdminTab('settings')">Settings</button>
+      </div>
+
+      <div id="adminUsersPane">
+        <form onsubmit="createUser(event)">
+          <div class="form-inline">
+            <input class="input" id="newUsername" placeholder="Username" required maxlength="64">
+            <input class="input" id="newUserPassword" type="password" placeholder="Password (optional)" title="Leave blank to generate a random password" autocomplete="new-password">
+            <select class="input" id="newUserRole" style="flex:0 0 auto;">
+              <option value="user">user</option>
+              <option value="admin">admin</option>
+            </select>
+            <button class="btn" type="submit">➕ Add user</button>
+          </div>
+        </form>
+        <div id="userSecret"></div>
+        <div id="userList"></div>
+        <div class="form-msg" id="userMsg"></div>
+      </div>
+
+      <div id="adminSettingsPane" style="display:none;">
+        <div class="muted" style="margin-bottom:8px;">Changes apply immediately and override command-line/environment values. Reset returns a setting to its startup value.</div>
+        <form onsubmit="saveSettings(event)">
+          <div id="settingsList"></div>
+          <div style="margin-top:14px;"><button class="btn" type="submit">💾 Save settings</button></div>
+        </form>
+        <div class="form-msg" id="settingsMsg"></div>
+      </div>
     </div>
   </div>
 
@@ -2162,7 +2316,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <span>${birdScore != null ? 'Bird Likelihood: <strong>' + escapeHtml(birdScore) + '%</strong>' : (isVid ? 'Video Clip' : 'No Bird Detected')}</span>
                 <span>${formatRelative(m.created_at)}</span>
               </div>
-              <div class="tile-actions">
+              <div class="tile-actions auth-only">
                 ${isDeleted ?
                   `<button class="btn btn-restore btn-restore-action" data-media-id="${escapeHtml(m.media_id)}">↩️ Restore</button>` :
                   `<button class="btn btn-danger btn-delete-action" data-media-id="${escapeHtml(m.media_id)}">🗑️ Delete</button>`
@@ -2207,79 +2361,550 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       });
     }
 
-    let userApiKey = sessionStorage.getItem("bb_downloader_api_key") || "";
+    let currentUser = null;
+    let passkeysEnabled = false;
 
-    function getAuthHeaders() {
-      const headers = { "Content-Type": "application/json" };
-      if (userApiKey) {
-        headers["X-API-Key"] = userApiKey;
+    async function api(method, url, body) {
+      const opts = { method, credentials: "same-origin", headers: {} };
+      if (body !== undefined) {
+        opts.headers["Content-Type"] = "application/json";
+        opts.body = JSON.stringify(body);
       }
-      return headers;
+      const resp = await fetch(url, opts);
+      let data = {};
+      try { data = await resp.json(); } catch (e) {}
+      if (resp.status === 401 && !url.startsWith("/api/auth/")) {
+        await refreshAuth();
+        openLogin("Please log in to continue.");
+      }
+      if (resp.status === 403 && data.code === "password_change_required") {
+        await refreshAuth();
+      }
+      if (!resp.ok) {
+        const err = new Error(data.message || resp.statusText);
+        err.status = resp.status;
+        err.data = data;
+        throw err;
+      }
+      return data;
     }
 
-    async function promptApiKeyIfNeeded(resp) {
-      if (resp.status === 401) {
-        const key = prompt("API Key required for this action:");
-        if (key) {
-          userApiKey = key.trim();
-          sessionStorage.setItem("bb_downloader_api_key", userApiKey);
-          return true;
+    function setMsg(id, text, ok) {
+      const el = document.getElementById(id);
+      el.textContent = text || "";
+      el.className = "form-msg " + (ok ? "ok" : "error");
+    }
+
+    async function refreshAuth() {
+      try {
+        const data = await api("GET", "/api/auth/me");
+        currentUser = data.user;
+        passkeysEnabled = !!data.passkeys_enabled;
+      } catch (e) {
+        currentUser = null;
+      }
+      document.body.classList.toggle("guest", !currentUser);
+      document.body.classList.toggle("is-admin", !!currentUser && currentUser.role === "admin");
+      document.body.classList.toggle("passkeys-on", passkeysEnabled);
+      document.getElementById("passkeysDisabledNote").style.display = passkeysEnabled ? "none" : "";
+      if (currentUser && currentUser.must_change_password) openAccount();
+      document.getElementById("accountBtn").innerHTML = currentUser
+        ? `👤 ${escapeHtml(currentUser.username)} <span class="role">(${escapeHtml(currentUser.role)})</span>`
+        : "👤 Account";
+    }
+
+    function openDialog(id) { document.getElementById(id).classList.add("active"); }
+    function closeDialog(id, e) {
+      if (e && e.target !== e.currentTarget) return;
+      document.getElementById(id).classList.remove("active");
+    }
+
+    function openLogin(message) {
+      setMsg("loginMsg", message || "", false);
+      openDialog("loginModal");
+      document.getElementById("loginUsername").focus();
+    }
+
+    async function afterLogin() {
+      closeDialog("loginModal");
+      document.getElementById("loginPassword").value = "";
+      await refreshAuth();
+      await loadStatus();
+    }
+
+    async function passwordLogin(e) {
+      e.preventDefault();
+      try {
+        await api("POST", "/api/auth/login", {
+          username: document.getElementById("loginUsername").value,
+          password: document.getElementById("loginPassword").value,
+        });
+        await afterLogin();
+      } catch (err) {
+        setMsg("loginMsg", err.message, false);
+      }
+    }
+
+    async function logout() {
+      try { await api("POST", "/api/auth/logout"); } catch (e) {}
+      ["accountModal", "adminModal"].forEach(id => closeDialog(id));
+      await refreshAuth();
+    }
+
+    // --- WebAuthn helpers ---
+    function b64urlToBuf(str) {
+      str = str.replace(/-/g, "+").replace(/_/g, "/");
+      while (str.length % 4) str += "=";
+      const bin = atob(str);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    function bufToB64url(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return btoa(bin).replace(/[+]/g, "-").replace(/[/]/g, "_").replace(/=+$/, "");
+    }
+
+    function passkeyError(err) {
+      if (err && err.name === "NotAllowedError") return "Passkey request was cancelled or timed out.";
+      if (err && err.name === "InvalidStateError") return "This authenticator already holds a passkey for your account.";
+      if (!window.PublicKeyCredential) return "This browser does not support passkeys.";
+      if (!window.isSecureContext) return "Passkeys require HTTPS.";
+      return (err && err.message) || "Passkey operation failed.";
+    }
+
+    async function passkeyLogin() {
+      try {
+        const opts = await api("POST", "/api/auth/passkey/login/options");
+        const publicKey = {
+          ...opts,
+          challenge: b64urlToBuf(opts.challenge),
+          allowCredentials: (opts.allowCredentials || []).map(c => ({ ...c, id: b64urlToBuf(c.id) })),
+        };
+        const cred = await navigator.credentials.get({ publicKey });
+        await api("POST", "/api/auth/passkey/login/verify", {
+          id: cred.id,
+          rawId: bufToB64url(cred.rawId),
+          type: cred.type,
+          response: {
+            clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+            authenticatorData: bufToB64url(cred.response.authenticatorData),
+            signature: bufToB64url(cred.response.signature),
+            userHandle: cred.response.userHandle ? bufToB64url(cred.response.userHandle) : null,
+          },
+          clientExtensionResults: cred.getClientExtensionResults(),
+          authenticatorAttachment: cred.authenticatorAttachment,
+        });
+        await afterLogin();
+      } catch (err) {
+        setMsg("loginMsg", passkeyError(err), false);
+      }
+    }
+
+    // --- Account dialog ---
+    function passwordChangePending() {
+      return !!(currentUser && currentUser.must_change_password);
+    }
+
+    async function openAccount() {
+      const pending = passwordChangePending();
+      const alreadyOpen = document.getElementById("accountModal").classList.contains("active");
+      document.getElementById("accountName").textContent = currentUser ? currentUser.username : "";
+      document.getElementById("pwRequiredNotice").style.display = pending ? "" : "none";
+      document.getElementById("accountExtras").style.display = pending ? "none" : "";
+      if (pending) ["adminModal", "loginModal"].forEach(id => closeDialog(id));
+      if (alreadyOpen && pending) return;
+      document.getElementById("newApiKey").innerHTML = "";
+      ["pwMsg", "passkeyMsg", "apiKeyMsg"].forEach(id => setMsg(id, ""));
+      openDialog("accountModal");
+      if (pending) {
+        document.getElementById("pwCurrent").focus();
+        return;
+      }
+      await Promise.all([loadPasskeys(), loadApiKeys()]);
+    }
+
+    async function changePassword(e) {
+      e.preventDefault();
+      try {
+        await api("POST", "/api/account/password", {
+          current_password: document.getElementById("pwCurrent").value,
+          new_password: document.getElementById("pwNew").value,
+        });
+        document.getElementById("pwCurrent").value = "";
+        document.getElementById("pwNew").value = "";
+        const wasPending = passwordChangePending();
+        if (wasPending) {
+          await refreshAuth();
+          document.getElementById("pwRequiredNotice").style.display = "none";
+          document.getElementById("accountExtras").style.display = "";
+          await Promise.all([loadPasskeys(), loadApiKeys(), loadStatus()]);
+        }
+        setMsg("pwMsg", "Password updated. Other sessions were signed out.", true);
+      } catch (err) {
+        setMsg("pwMsg", err.message, false);
+      }
+    }
+
+    async function loadPasskeys() {
+      if (!passkeysEnabled) return;
+      try {
+        const data = await api("GET", "/api/account/passkeys");
+        const el = document.getElementById("passkeyList");
+        if (!data.passkeys.length) {
+          el.innerHTML = '<div class="muted">No passkeys registered yet.</div>';
+          return;
+        }
+        el.innerHTML = `<table class="list-table"><tr><th>Name</th><th>Added</th><th>Last used</th><th></th></tr>` +
+          data.passkeys.map(k => `<tr>
+            <td>${escapeHtml(k.name)}</td>
+            <td>${formatRelative(k.created_at)}</td>
+            <td>${k.last_used_at ? formatRelative(k.last_used_at) : "Never"}</td>
+            <td style="text-align:right; white-space:nowrap;">
+              <button class="btn btn-secondary btn-small" data-id="${escapeHtml(k.id)}" data-name="${escapeHtml(k.name)}" onclick="renamePasskey(this)">Rename</button>
+              <button class="btn btn-danger" data-id="${escapeHtml(k.id)}" onclick="removePasskey(this)">Remove</button>
+            </td></tr>`).join("") + `</table>`;
+      } catch (err) {
+        setMsg("passkeyMsg", err.message, false);
+      }
+    }
+
+    async function addPasskey() {
+      try {
+        const opts = await api("POST", "/api/account/passkeys/register/options");
+        const publicKey = {
+          ...opts,
+          challenge: b64urlToBuf(opts.challenge),
+          user: { ...opts.user, id: b64urlToBuf(opts.user.id) },
+          excludeCredentials: (opts.excludeCredentials || []).map(c => ({ ...c, id: b64urlToBuf(c.id) })),
+        };
+        const cred = await navigator.credentials.create({ publicKey });
+        const nameInput = document.getElementById("passkeyName");
+        await api("POST", "/api/account/passkeys/register/verify", {
+          name: nameInput.value,
+          credential: {
+            id: cred.id,
+            rawId: bufToB64url(cred.rawId),
+            type: cred.type,
+            response: {
+              clientDataJSON: bufToB64url(cred.response.clientDataJSON),
+              attestationObject: bufToB64url(cred.response.attestationObject),
+              transports: cred.response.getTransports ? cred.response.getTransports() : [],
+            },
+            clientExtensionResults: cred.getClientExtensionResults(),
+            authenticatorAttachment: cred.authenticatorAttachment,
+          },
+        });
+        nameInput.value = "";
+        setMsg("passkeyMsg", "Passkey added.", true);
+        await loadPasskeys();
+      } catch (err) {
+        setMsg("passkeyMsg", passkeyError(err), false);
+      }
+    }
+
+    async function renamePasskey(btn) {
+      const name = prompt("New passkey name:", btn.dataset.name);
+      if (!name) return;
+      try {
+        await api("PATCH", "/api/account/passkeys/" + encodeURIComponent(btn.dataset.id), { name });
+        await loadPasskeys();
+      } catch (err) {
+        setMsg("passkeyMsg", err.message, false);
+      }
+    }
+
+    async function removePasskey(btn) {
+      if (!confirm("Remove this passkey? You will no longer be able to sign in with it.")) return;
+      try {
+        await api("DELETE", "/api/account/passkeys/" + encodeURIComponent(btn.dataset.id));
+        await loadPasskeys();
+      } catch (err) {
+        setMsg("passkeyMsg", err.message, false);
+      }
+    }
+
+    function secretBox(label, secret) {
+      return `<div class="muted">${escapeHtml(label)}</div>
+        <div class="secret-box"><span>${escapeHtml(secret)}</span>
+        <button class="btn btn-secondary btn-small" type="button" data-secret="${escapeHtml(secret)}" onclick="copySecret(this)">Copy</button></div>`;
+    }
+
+    async function copySecret(btn) {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.secret);
+        btn.textContent = "Copied";
+      } catch (e) {
+        btn.textContent = "Select & copy manually";
+      }
+    }
+
+    async function loadApiKeys() {
+      try {
+        const data = await api("GET", "/api/account/api-keys");
+        const el = document.getElementById("apiKeyList");
+        if (!data.api_keys.length) {
+          el.innerHTML = '<div class="muted">No API keys yet.</div>';
+          return;
+        }
+        el.innerHTML = `<table class="list-table"><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>` +
+          data.api_keys.map(k => `<tr>
+            <td>${escapeHtml(k.name)}</td>
+            <td><code>${escapeHtml(k.prefix)}…</code></td>
+            <td>${formatRelative(k.created_at)}</td>
+            <td>${k.last_used_at ? formatRelative(k.last_used_at) : "Never"}</td>
+            <td style="text-align:right;"><button class="btn btn-danger" data-id="${k.id}" onclick="revokeApiKey(this)">Revoke</button></td>
+          </tr>`).join("") + `</table>`;
+      } catch (err) {
+        setMsg("apiKeyMsg", err.message, false);
+      }
+    }
+
+    async function createApiKey() {
+      try {
+        const nameInput = document.getElementById("apiKeyName");
+        const data = await api("POST", "/api/account/api-keys", { name: nameInput.value });
+        nameInput.value = "";
+        document.getElementById("newApiKey").innerHTML = secretBox("Copy this key now. It will not be shown again.", data.api_key.key);
+        await loadApiKeys();
+      } catch (err) {
+        setMsg("apiKeyMsg", err.message, false);
+      }
+    }
+
+    async function revokeApiKey(btn) {
+      if (!confirm("Revoke this API key? Scripts using it will stop working.")) return;
+      try {
+        await api("DELETE", "/api/account/api-keys/" + btn.dataset.id);
+        await loadApiKeys();
+      } catch (err) {
+        setMsg("apiKeyMsg", err.message, false);
+      }
+    }
+
+    // --- Admin dialog ---
+    async function openAdmin() {
+      document.getElementById("userSecret").innerHTML = "";
+      ["userMsg", "settingsMsg"].forEach(id => setMsg(id, ""));
+      openDialog("adminModal");
+      showAdminTab("users");
+    }
+
+    function showAdminTab(tab) {
+      document.getElementById("tabUsers").classList.toggle("active", tab === "users");
+      document.getElementById("tabSettings").classList.toggle("active", tab === "settings");
+      document.getElementById("adminUsersPane").style.display = tab === "users" ? "" : "none";
+      document.getElementById("adminSettingsPane").style.display = tab === "settings" ? "" : "none";
+      if (tab === "users") loadUsers(); else loadSettings();
+    }
+
+    async function loadUsers() {
+      try {
+        const data = await api("GET", "/api/admin/users");
+        document.getElementById("userList").innerHTML = `<table class="list-table"><tr><th>User</th><th>Role</th><th>Passkeys</th><th>API keys</th><th></th></tr>` +
+          data.users.map(u => {
+            const self = currentUser && u.id === currentUser.id;
+            return `<tr>
+              <td>${escapeHtml(u.username)}${self ? ' <span class="muted">(you)</span>' : ""}
+                ${u.must_change_password ? '<div class="muted">password change pending</div>' : ""}</td>
+              <td><select class="input" data-id="${u.id}" onchange="setUserRole(this)">
+                <option value="user"${u.role === "user" ? " selected" : ""}>user</option>
+                <option value="admin"${u.role === "admin" ? " selected" : ""}>admin</option>
+              </select></td>
+              <td>${u.passkeys}</td>
+              <td>${u.api_keys}</td>
+              <td style="text-align:right; white-space:nowrap;">
+                <button class="btn btn-secondary btn-small" data-id="${u.id}" data-name="${escapeHtml(u.username)}" onclick="resetUserPassword(this)">Reset password</button>
+                ${self ? "" : `<button class="btn btn-danger" data-id="${u.id}" data-name="${escapeHtml(u.username)}" onclick="deleteUser(this)">Delete</button>`}
+              </td></tr>`;
+          }).join("") + `</table>`;
+      } catch (err) {
+        setMsg("userMsg", err.message, false);
+      }
+    }
+
+    async function createUser(e) {
+      e.preventDefault();
+      const username = document.getElementById("newUsername").value.trim();
+      const password = document.getElementById("newUserPassword").value;
+      try {
+        const body = { username, role: document.getElementById("newUserRole").value };
+        if (password) body.password = password;
+        const data = await api("POST", "/api/admin/users", body);
+        document.getElementById("newUsername").value = "";
+        document.getElementById("newUserPassword").value = "";
+        document.getElementById("userSecret").innerHTML = data.password
+          ? secretBox(`Generated password for ${username}. It will not be shown again and must be changed at first login.`, data.password)
+          : "";
+        setMsg("userMsg", `User ${username} created. They must choose a new password at first login.`, true);
+        await loadUsers();
+      } catch (err) {
+        setMsg("userMsg", err.message, false);
+      }
+    }
+
+    async function setUserRole(sel) {
+      try {
+        await api("PATCH", "/api/admin/users/" + sel.dataset.id, { role: sel.value });
+        setMsg("userMsg", "Role updated.", true);
+        await refreshAuth();
+        if (!currentUser || currentUser.role !== "admin") {
+          closeDialog("adminModal");
+          return;
+        }
+      } catch (err) {
+        setMsg("userMsg", err.message, false);
+      }
+      await loadUsers();
+    }
+
+    async function resetUserPassword(btn) {
+      if (!confirm(`Reset the password for ${btn.dataset.name}? Their existing sessions will be signed out.`)) return;
+      try {
+        const data = await api("PATCH", "/api/admin/users/" + btn.dataset.id, { reset_password: true });
+        document.getElementById("userSecret").innerHTML = secretBox(`New single-use password for ${btn.dataset.name}. It will not be shown again.`, data.password);
+        await loadUsers();
+        if (currentUser && String(currentUser.id) === btn.dataset.id) await refreshAuth();
+      } catch (err) {
+        setMsg("userMsg", err.message, false);
+      }
+    }
+
+    async function deleteUser(btn) {
+      if (!confirm(`Delete user ${btn.dataset.name}? Their passkeys and API keys are removed too.`)) return;
+      try {
+        await api("DELETE", "/api/admin/users/" + btn.dataset.id);
+        setMsg("userMsg", `User ${btn.dataset.name} deleted.`, true);
+        await loadUsers();
+      } catch (err) {
+        setMsg("userMsg", err.message, false);
+      }
+    }
+
+    let loadedSettings = [];
+
+    function settingInput(s) {
+      const id = "setting_" + s.key;
+      if (s.type === "bool") {
+        return `<input type="checkbox" id="${id}"${s.value ? " checked" : ""}>`;
+      }
+      const type = s.type === "str" ? "text" : "number";
+      const step = s.type === "float" ? ' step="any"' : (s.type === "int" ? ' step="1"' : "");
+      const val = s.value == null ? "" : s.value;
+      return `<input class="input" type="${type}"${step} min="0" id="${id}" value="${escapeHtml(val)}">`;
+    }
+
+    function formatDefault(v) {
+      if (v === null || v === undefined || v === "") return "(empty)";
+      return String(v);
+    }
+
+    async function loadSettings() {
+      try {
+        const data = await api("GET", "/api/admin/settings");
+        renderSettings(data.settings);
+      } catch (err) {
+        setMsg("settingsMsg", err.message, false);
+      }
+    }
+
+    function renderSettings(settings) {
+      loadedSettings = settings;
+      document.getElementById("settingsList").innerHTML = settings.map(s => `
+        <div class="setting-row">
+          <label for="setting_${s.key}"><strong>${escapeHtml(s.label)}</strong>
+            ${s.overridden ? '<span class="badge badge-best-view" style="margin-left:6px;">custom</span>' : ""}</label>
+          <div style="display:flex; gap:6px; align-items:center;">
+            ${s.overridden ? `<button class="btn btn-secondary btn-small" type="button" data-key="${s.key}" onclick="resetSetting(this)">Reset</button>` : ""}
+          </div>
+          <div style="grid-column: 1 / -1;">${settingInput(s)}</div>
+          <div class="muted">${escapeHtml(s.help)} Startup value: <code>${escapeHtml(formatDefault(s.default))}</code>${s.updated_by ? ` · changed by ${escapeHtml(s.updated_by)} ${formatRelative(s.updated_at)}` : ""}</div>
+        </div>`).join("");
+    }
+
+    async function saveSettings(e) {
+      e.preventDefault();
+      const changes = {};
+      for (const s of loadedSettings) {
+        const el = document.getElementById("setting_" + s.key);
+        let val;
+        if (s.type === "bool") val = el.checked;
+        else if (s.type === "int") val = el.value === "" ? null : Number(el.value);
+        else if (s.type === "float") val = el.value === "" ? null : Number(el.value);
+        else val = el.value;
+        const current = s.value == null ? (s.type === "str" ? "" : null) : s.value;
+        if (val !== current) changes[s.key] = val;
+      }
+      document.querySelectorAll("#settingsList .input-invalid").forEach(el => el.classList.remove("input-invalid"));
+      document.querySelectorAll("#settingsList .field-error").forEach(el => el.remove());
+      if (!Object.keys(changes).length) {
+        setMsg("settingsMsg", "No changes to save.", true);
+        return;
+      }
+      try {
+        const data = await api("PUT", "/api/admin/settings", changes);
+        renderSettings(data.settings);
+        setMsg("settingsMsg", "Settings saved.", true);
+        await loadStatus();
+      } catch (err) {
+        const errors = (err.data && err.data.errors) || {};
+        const keys = Object.keys(errors);
+        if (!keys.length) {
+          setMsg("settingsMsg", err.message, false);
+          return;
+        }
+        const labels = Object.fromEntries(loadedSettings.map(s => [s.key, s.label]));
+        setMsg("settingsMsg", keys.map(k => `${labels[k] || k} ${errors[k]}`).join("; "), false);
+        keys.forEach(k => {
+          const el = document.getElementById("setting_" + k);
+          if (!el) return;
+          el.classList.add("input-invalid");
+          const msg = document.createElement("div");
+          msg.className = "field-error";
+          msg.textContent = `${labels[k] || k} ${errors[k]}`;
+          el.parentElement.after(msg);
+        });
+        const first = document.getElementById("setting_" + keys[0]);
+        if (first) {
+          first.scrollIntoView({ block: "center" });
+          first.focus();
         }
       }
-      return false;
+    }
+
+    async function resetSetting(btn) {
+      try {
+        const data = await api("DELETE", "/api/admin/settings/" + encodeURIComponent(btn.dataset.key));
+        renderSettings(data.settings);
+        setMsg("settingsMsg", "Setting reset to its startup value.", true);
+        await loadStatus();
+      } catch (err) {
+        setMsg("settingsMsg", err.message, false);
+      }
     }
 
     async function deleteMedia(mediaId) {
       try {
-        let resp = await fetch("/api/media/delete", {
-          method: "POST",
-          headers: getAuthHeaders(),
-          body: JSON.stringify({ media_id: mediaId })
-        });
-        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
-          resp = await fetch("/api/media/delete", {
-            method: "POST",
-            headers: getAuthHeaders(),
-            body: JSON.stringify({ media_id: mediaId })
-          });
-        }
-        if (resp.ok) {
-          lastRenderedSightingsJson = "";
-          await fetchSightings();
-          await loadStatus();
-        } else {
-          const err = await resp.json();
-          alert("Error deleting media: " + (err.message || resp.statusText));
-        }
+        await api("POST", "/api/media/delete", { media_id: mediaId });
+        lastRenderedSightingsJson = "";
+        await fetchSightings();
+        await loadStatus();
       } catch (e) {
-        alert("Failed to delete media: " + e.message);
+        if (e.status !== 401) alert("Error deleting media: " + e.message);
       }
     }
 
     async function restoreMedia(mediaId) {
       try {
-        let resp = await fetch("/api/media/restore", {
-          method: "POST",
-          headers: getAuthHeaders(),
-          body: JSON.stringify({ media_id: mediaId })
-        });
-        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
-          resp = await fetch("/api/media/restore", {
-            method: "POST",
-            headers: getAuthHeaders(),
-            body: JSON.stringify({ media_id: mediaId })
-          });
-        }
-        if (resp.ok) {
-          lastRenderedSightingsJson = "";
-          await fetchSightings();
-          await loadStatus();
-        } else {
-          const err = await resp.json();
-          alert("Error restoring media: " + (err.message || resp.statusText));
-        }
+        await api("POST", "/api/media/restore", { media_id: mediaId });
+        lastRenderedSightingsJson = "";
+        await fetchSightings();
+        await loadStatus();
       } catch (e) {
-        alert("Failed to restore media: " + e.message);
+        if (e.status !== 401) alert("Error restoring media: " + e.message);
       }
     }
 
@@ -2316,20 +2941,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerText = "Triggering sync...";
       try {
-        let resp = await fetch("/api/sync", { method: "POST", headers: getAuthHeaders() });
-        if (resp.status === 401 && (await promptApiKeyIfNeeded(resp))) {
-          resp = await fetch("/api/sync", { method: "POST", headers: getAuthHeaders() });
-        }
-        if (resp.ok) {
-          setTimeout(loadStatus, 500);
-        } else {
-          const err = await resp.json();
-          alert("Sync error: " + (err.message || resp.statusText));
-          btn.disabled = false;
-          btn.innerHTML = "<span>⚡ Sync Now</span>";
-        }
+        await api("POST", "/api/sync");
+        setTimeout(loadStatus, 500);
       } catch (e) {
-        alert("Error triggering sync: " + e.message);
+        if (e.status !== 401) alert("Sync error: " + e.message);
         btn.disabled = false;
         btn.innerHTML = "<span>⚡ Sync Now</span>";
       }
@@ -2349,7 +2964,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       toggle.onchange = setupAutoRefresh;
     }
 
-    loadStatus();
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        ["loginModal", "accountModal", "adminModal"].forEach(id => closeDialog(id));
+      }
+    });
+
+    refreshAuth().then(loadStatus);
     setupAutoRefresh();
   </script>
 </body>
@@ -2426,21 +3047,6 @@ async def handle_api_status(request: web.Request) -> web.Response:
         "sightings": sightings,
     }
     return web.json_response(data)
-
-
-def check_api_auth(request: web.Request, downloader: BirdBuddyDownloader) -> bool:
-    """Validate optional API key for mutating endpoints if configured."""
-    configured_key = getattr(downloader.args, "web_api_key", None) or os.getenv(
-        "WEB_API_KEY"
-    )
-    if not configured_key:
-        return True
-    header_key = request.headers.get("X-API-Key")
-    auth_header = request.headers.get("Authorization", "")
-    bearer_key = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
-    query_key = request.query.get("api_key")
-    provided = header_key or bearer_key or query_key
-    return provided == configured_key
 
 
 async def handle_api_sightings(request: web.Request) -> web.Response:
@@ -2633,13 +3239,10 @@ async def handle_media_thumb(request: web.Request) -> web.Response:
     return web.FileResponse(active_path, headers={"Content-Type": "image/jpeg"})
 
 
+@auth.require_role("user")
 async def handle_media_delete(request: web.Request) -> web.Response:
     """Soft delete media item and move to .trash/."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
-    if not check_api_auth(request, downloader):
-        return web.json_response(
-            {"status": "error", "message": "Unauthorized"}, status=401
-        )
     try:
         data = await request.json()
         media_id = data.get("media_id")
@@ -2661,13 +3264,10 @@ async def handle_media_delete(request: web.Request) -> web.Response:
     )
 
 
+@auth.require_role("user")
 async def handle_media_restore(request: web.Request) -> web.Response:
     """Restore soft-deleted media item from .trash/."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
-    if not check_api_auth(request, downloader):
-        return web.json_response(
-            {"status": "error", "message": "Unauthorized"}, status=401
-        )
     try:
         data = await request.json()
         media_id = data.get("media_id")
@@ -2689,13 +3289,10 @@ async def handle_media_restore(request: web.Request) -> web.Response:
     )
 
 
+@auth.require_role("user")
 async def handle_api_sync(request: web.Request) -> web.Response:
     """Trigger on-demand sync cycle immediately."""
     downloader: BirdBuddyDownloader = request.app["downloader"]
-    if not check_api_auth(request, downloader):
-        return web.json_response(
-            {"status": "error", "message": "Unauthorized"}, status=401
-        )
     if downloader.is_syncing:
         return web.json_response(
             {
@@ -2714,8 +3311,13 @@ async def create_web_app(
     downloader: BirdBuddyDownloader,
 ) -> web.Application:
     """Create and configure aiohttp web application."""
-    app = web.Application()
+    app = web.Application(middlewares=[auth.auth_middleware])
     app["downloader"] = downloader
+    auth.setup_auth(
+        app,
+        downloader.conn,
+        auth.AuthConfig(public_url=getattr(downloader.args, "web_public_url", None)),
+    )
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_api_status)
     app.router.add_get("/api/sightings", handle_api_sightings)
@@ -2962,9 +3564,18 @@ def parse_args():
         help="Host address to bind embedded web dashboard (default: 0.0.0.0 or WEB_HOST env var)",
     )
     parser.add_argument(
-        "--web-api-key",
-        default=os.getenv("WEB_API_KEY"),
-        help="Optional API key secret to protect mutating endpoints (/api/media/delete, /api/media/restore, /api/sync)",
+        "--web-public-url",
+        default=os.getenv("WEB_PUBLIC_URL"),
+        help="Public HTTPS URL of the dashboard, e.g. https://birds.example.com (or WEB_PUBLIC_URL env var). "
+        "Required for passkey login; also marks session cookies Secure",
+    )
+    parser.add_argument(
+        "--reset-password",
+        dest="reset_web_user",
+        metavar="USERNAME",
+        help="Reset the web dashboard password for USERNAME and exit. In an interactive "
+        "terminal you are prompted for the new password; otherwise a single-use random "
+        "password is generated and printed",
     )
     parser.add_argument(
         "--no-web",
@@ -2999,6 +3610,41 @@ def parse_args():
     return parser.parse_args()
 
 
+def reset_password_cli(conn: sqlite3.Connection, username: str) -> int:
+    """Handle --reset-password. Returns a process exit code."""
+    try:
+        if not auth.get_user_by_username(conn, username):
+            print(f"Error: no web dashboard user named '{username}'.", file=sys.stderr)
+            return 1
+
+        if sys.stdin.isatty():
+            # Interactive: the operator chooses the password and nothing is echoed or printed
+            new_password = getpass.getpass(f"New password for '{username}': ")
+            if auth.validate_new_password(new_password):
+                print(
+                    f"Error: the password must be at least {auth.MIN_PASSWORD_LENGTH} characters.",
+                    file=sys.stderr,
+                )
+                return 1
+            if getpass.getpass("Repeat new password: ") != new_password:
+                print("Error: passwords do not match.", file=sys.stderr)
+                return 1
+            auth.reset_user_password(conn, username, new_password)
+            print(
+                f"Password for '{username}' updated. Existing sessions were signed out."
+            )
+            return 0
+
+        # Non-interactive (e.g. `podman exec` without -it): generate a single-use password
+        generated = auth.reset_user_password(conn, username)
+        print(
+            f"Single-use password for '{username}' (must be changed at next login): {generated}"
+        )
+        return 0
+    finally:
+        conn.close()
+
+
 async def main():
     args = parse_args()
 
@@ -3006,6 +3652,11 @@ async def main():
         logger.setLevel(logging.DEBUG)
 
     conn = init_db(args.db_path)
+
+    if args.reset_web_user:
+        sys.exit(reset_password_cli(conn, args.reset_web_user))
+
+    auth.apply_settings_overrides(args, conn)
     downloader = BirdBuddyDownloader(args, conn)
 
     if args.info:
@@ -3029,6 +3680,16 @@ async def main():
 
     runner = None
     if not args.no_web:
+        auth.ensure_initial_admin(conn)
+        if os.getenv("WEB_API_KEY"):
+            logger.warning(
+                "WEB_API_KEY is no longer supported and is ignored. Log in to the dashboard "
+                "and create a personal API key from the Account menu instead."
+            )
+        if not args.web_public_url:
+            logger.info(
+                "Passkey login disabled (set WEB_PUBLIC_URL to the dashboard's HTTPS address to enable it)."
+            )
         try:
             app = await create_web_app(downloader)
             runner = web.AppRunner(app)
@@ -3049,64 +3710,57 @@ async def main():
             logger.info(
                 f"Starting Bird Buddy Downloader (Single Run mode){mode_label}..."
             )
-            await downloader.run_once()
-            if not downloader.stop_requested:
-                logger.info(f"Done{mode_label}!")
-            if not args.no_web and not downloader.stop_requested:
-                logger.info(
-                    "Web dashboard active. Keeping process alive (Press Ctrl-C to exit)..."
-                )
-                while not downloader.stop_requested:
-                    try:
-                        downloader.sync_trigger_event.clear()
-                        await asyncio.wait_for(
-                            downloader.sync_trigger_event.wait(), timeout=1.0
-                        )
-                        if not downloader.stop_requested:
-                            logger.info("Manual sync triggered via web interface...")
-                            await downloader.run_once()
-                    except asyncio.TimeoutError:
-                        pass
         else:
             logger.info(
                 f"Starting Bird Buddy Downloader in Continuous Daemon mode (Interval: {args.interval}s){mode_label}..."
             )
+        while not downloader.stop_requested:
+            try:
+                await downloader.run_once()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info("Run cycle interrupted by user.")
+                break
+            except Exception as e:
+                logger.error(f"Error during download cycle: {e}")
+
+            if downloader.stop_requested:
+                break
+            if args.interval <= 0 and args.no_web:
+                logger.info(f"Done{mode_label}!")
+                break
+
+            # Wait for the next interval or a manual trigger. args.interval is re-read
+            # every second so changes made on the web settings page apply immediately.
+            cycle_end = datetime.now(timezone.utc)
+            downloader.sync_trigger_event.clear()
+            announced_interval = None
             while not downloader.stop_requested:
-                try:
-                    await downloader.run_once()
-                except (KeyboardInterrupt, asyncio.CancelledError):
-                    logger.info("Run cycle interrupted by user.")
-                    break
-                except Exception as e:
-                    logger.error(f"Error during download cycle: {e}")
-
-                if downloader.stop_requested:
-                    break
-
-                downloader.next_sync_time = datetime.now(timezone.utc) + timedelta(
-                    seconds=args.interval
-                )
-                downloader.sync_trigger_event.clear()
-                logger.info(
-                    f"Sleeping for {args.interval} seconds until next check (Next sync at {downloader.next_sync_time.strftime('%H:%M:%S')} UTC)..."
-                )
-
-                sleep_remaining = args.interval
-                while sleep_remaining > 0 and not downloader.stop_requested:
-                    try:
-                        await asyncio.wait_for(
-                            downloader.sync_trigger_event.wait(),
-                            timeout=min(1.0, sleep_remaining),
+                interval = args.interval
+                if interval > 0:
+                    downloader.next_sync_time = cycle_end + timedelta(seconds=interval)
+                    if datetime.now(timezone.utc) >= downloader.next_sync_time:
+                        break
+                    if interval != announced_interval:
+                        logger.info(
+                            f"Sleeping for {interval} seconds until next check (Next sync at {downloader.next_sync_time.strftime('%H:%M:%S')} UTC)..."
                         )
-                        if (
-                            downloader.sync_trigger_event.is_set()
-                            and not downloader.stop_requested
-                        ):
-                            logger.info("Immediate sync requested via web interface!")
-                            downloader.sync_trigger_event.clear()
-                            break
-                    except asyncio.TimeoutError:
-                        sleep_remaining -= 1.0
+                        announced_interval = interval
+                else:
+                    downloader.next_sync_time = None
+                    if announced_interval != 0:
+                        logger.info(
+                            f"Done{mode_label}! Web dashboard active; waiting for Sync Now (Press Ctrl-C to exit)..."
+                        )
+                        announced_interval = 0
+                try:
+                    await asyncio.wait_for(
+                        downloader.sync_trigger_event.wait(), timeout=1.0
+                    )
+                    if not downloader.stop_requested:
+                        logger.info("Immediate sync requested via web interface!")
+                    break
+                except asyncio.TimeoutError:
+                    pass
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Downloader process stopped by user signal.")
@@ -3121,5 +3775,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         sys.exit(0)
