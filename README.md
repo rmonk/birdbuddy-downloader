@@ -145,13 +145,17 @@ podman run --rm --env-file .env \
 ### 4. Automated Container Builds (GitHub Actions)
 
 A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and publish them to Docker Hub:
-- **`main` Branch**: Tagged with `:latest` and a date-based build version `:YYYYMMDDNN` (UTC date plus a two-digit daily build number starting at `01`, e.g. `:2026092801`) on every merge/push to `main`. A matching git tag is created for each build.
 - **Pull Requests**: Tagged with `:pr-<branch_name>` and `:pr-<pr_number>` for pull requests originating from source branches within this repository only when the latest PR commit has a `stage` git tag (never built or published for forks).
-- **Release Tags**: Tagged with semantic version tags (e.g. `:v1.0.0`, `:v1.0`).
+- **Release Tags**: Pushing a version tag `vX.Y.Z` on a commit that is already on `main` publishes `:X.Y.Z`, `:X.Y` and `:latest`. For example, `v2.1.0` gives `:2.1.0`, `:2.1` and `:latest`. This is the only way `:latest` or a version tag is published. A pre-release such as `v2.1.0-rc.1` gets only `:2.1.0-rc.1`. A version tag on a commit that isn't on `main` fails the workflow and publishes nothing.
+  ```bash
+  git fetch origin && git tag -a v2.1.0 -m "v2.1.0" origin/main && git push origin v2.1.0
+  ```
+- **`main` Branch**: Merging or pushing to `main` builds nothing. Use the `dev` tag below to test `main` before a release.
 - **`dev` Tag**: Pushing the git tag `dev` builds that commit and publishes it as `:dev` only, for testing before a release. It never gets `:latest` or a version tag. `dev` is a moving tag, so force-push it to move it to the current `main`:
   ```bash
   git fetch origin && git tag -f dev origin/main && git push -f origin dev
   ```
+- **Manual Runs** (*Run workflow* in the Actions tab): Run on a branch, it publishes `:sha-<short_sha>` only. Run on an existing release tag, it rebuilds that release under the same rules.
 
 **Required GitHub Repository Secrets**:
 - `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).
