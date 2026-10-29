@@ -1548,43 +1548,44 @@ class BirdBuddyDownloader:
             return 0
 
         logger.info("Checking collections...")
-        total_downloaded = 0
         try:
             data = await self.bb._make_request(query=me_queries.COLLECTIONS)
-            collections = data.get("me", {}).get("collections", [])
-            if not collections or self.stop_requested:
-                return 0
+        except Exception as e:
+            if not self.stop_requested:
+                logger.error(f"Could not fetch collections list: {e}")
+            return 0
+        collections = (data or {}).get("me", {}).get("collections", [])
+        if not collections or self.stop_requested:
+            return 0
 
-            logger.info(
-                f"Found {len(collections)} collection(s). Syncing collection media..."
-            )
-            total_would_download = 0
-            total_skipped = 0
+        logger.info(
+            f"Found {len(collections)} collection(s). Syncing collection media..."
+        )
+        total_downloaded = 0
+        total_would_download = 0
+        total_skipped = 0
+        failed = 0
 
-            for c in collections:
-                if self.stop_requested:
-                    break
-                cid = c.get("id")
-                species = (
-                    c.get("species", {}).get("name", "Unknown Species")
-                    if "species" in c
-                    else "Unknown Species"
-                )
+        for c in collections:
+            if self.stop_requested:
+                break
+            cid = c.get("id")
+            species = (c.get("species") or {}).get("name") or "Unknown Species"
+            label = f"'{species}' ({cid})"
 
-                cursor = None
+            cursor = None
+            try:
                 while not self.stop_requested:
+                    variables = {"collectionId": cid, "first": 50}
+                    # The API rejects after: null, so only send a cursor once we have one.
+                    if cursor:
+                        variables["after"] = cursor
                     media_data = await self.bb._make_request(
                         query=me_queries.COLLECTIONS_MEDIA,
-                        variables={
-                            "collectionId": cid,
-                            "first": 50,
-                            "after": cursor,
-                        },
+                        variables=variables,
                     )
-                    collection_obj = media_data.get("collection", {})
-                    media_conn = (
-                        collection_obj.get("media", {}) if collection_obj else {}
-                    )
+                    collection_obj = (media_data or {}).get("collection") or {}
+                    media_conn = collection_obj.get("media") or {}
                     edges = media_conn.get("edges", [])
                     if not edges or self.stop_requested:
                         break
@@ -1628,21 +1629,29 @@ class BirdBuddyDownloader:
                             total_skipped += 1
 
                     page_info = media_conn.get("pageInfo", {})
-                    if not page_info.get("hasNextPage") or self.stop_requested:
+                    next_cursor = page_info.get("endCursor")
+                    if (
+                        not page_info.get("hasNextPage")
+                        or not next_cursor
+                        or next_cursor == cursor
+                    ):
                         break
-                    cursor = page_info.get("endCursor")
+                    cursor = next_cursor
+            except Exception as e:
+                if self.stop_requested:
+                    break
+                failed += 1
+                logger.warning(f"Collection {label} sync failed: {e}")
 
-            if self.args.dry_run:
-                logger.info(
-                    f"[DRY-RUN COLLECTIONS SUMMARY] Would download: {total_would_download} item(s) | Skipped: {total_skipped} item(s)"
-                )
-            else:
-                logger.info(
-                    f"Collections sync complete. New media downloaded: {total_downloaded}"
-                )
-        except Exception as e:
-            if not self.stop_requested:
-                logger.debug(f"Collections sync skipped or encountered error: {e}")
+        failed_str = f" | Failed collections: {failed}" if failed else ""
+        if self.args.dry_run:
+            logger.info(
+                f"[DRY-RUN COLLECTIONS SUMMARY] Would download: {total_would_download} item(s) | Skipped: {total_skipped} item(s){failed_str}"
+            )
+        else:
+            logger.info(
+                f"Collections sync complete. New media downloaded: {total_downloaded}{failed_str}"
+            )
         return total_downloaded
 
     async def get_account_info(self) -> dict:
