@@ -1,11 +1,19 @@
 name: Build and Push Container Image
 
+# Published tags:
+#   release git tag (moving) on a commit in main -> :latest and :YYYYMMDDNN (+ git tag YYYYMMDDNN)
+#   dev git tag (moving)                         -> :dev
+#   PR with a `stage` tag on its head            -> :pr-<branch>, :pr-<number>
+#   manual run on release / dev                  -> same as pushing that tag
+#   manual run on anything else                  -> :sha-<short sha>
+# Pushes to main build nothing; :latest and version tags come only from the release tag.
 on:
   push:
-    branches:
-      - main
     tags:
-      - 'v*.*.*'
+      # Moving `release` tag on a main commit: :latest + date-based :YYYYMMDDNN
+      - 'release'
+      # Moving `dev` tag: builds the tagged commit as :dev only (no :latest, no version tag)
+      - 'dev'
   pull_request:
     branches:
       - main
@@ -13,7 +21,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel a release mid-run: its YYYYMMDDNN git tag may already be pushed.
+  cancel-in-progress: ${{ github.ref != 'refs/tags/release' }}
 
 jobs:
   check-pr-stage:
@@ -25,6 +34,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      is_release: ${{ steps.check.outputs.is_release }}
 
     steps:
       - name: Checkout repository with tags
@@ -35,9 +45,10 @@ jobs:
       - name: Fetch all tags
         run: git fetch --tags --force
 
-      - name: Verify Stage Tag for PR
+      - name: Verify Stage Tag for PR / Release Tag on main
         id: check
         run: |
+          IS_RELEASE=false
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             HEAD_SHA="${{ github.event.pull_request.head.sha }}"
             echo "Checking tags for PR head commit: $HEAD_SHA"
@@ -51,10 +62,21 @@ jobs:
               echo "PR commit does NOT have a 'stage' tag. Container build skipped."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
+          elif [ "$GITHUB_REF" = "refs/tags/release" ]; then
+            # Releases (:latest and version tags) only come from commits already merged to main.
+            if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "Release tag is on main ($GITHUB_SHA). Proceeding with release build."
+              IS_RELEASE=true
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::The release tag points at $GITHUB_SHA, which is not on main. Nothing was published."
+              exit 1
+            fi
           else
-            echo "Event is ${{ github.event_name }}. Proceeding with container build."
+            echo "Event is ${{ github.event_name }} on $GITHUB_REF. Proceeding with container build."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     name: Build & Push to Docker Hub
@@ -62,9 +84,11 @@ jobs:
     if: needs.check-pr-stage.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
+      # Needed to push the YYYYMMDDNN git tag for releases.
       contents: write
     env:
-      IS_MAIN_BUILD: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+      IS_RELEASE: ${{ needs.check-pr-stage.outputs.is_release }}
+      IS_DEV_BUILD: ${{ github.event_name != 'pull_request' && github.ref == 'refs/tags/dev' }}
 
     steps:
       - name: Checkout repository
@@ -72,7 +96,7 @@ jobs:
 
       - name: Reserve date-based build version
         id: version
-        if: env.IS_MAIN_BUILD == 'true'
+        if: env.IS_RELEASE == 'true'
         run: |
           # Version format: YYYYMMDDNN (UTC date + two-digit daily build number starting at 01).
           # The git tag is pushed before building so concurrent runs can never claim the same number.
@@ -121,14 +145,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: docker.io/moosemouse/birdbuddy-downloader
+          # :latest is only ever set by the explicit release rule below.
+          flavor: |
+            latest=false
           tags: |
-            type=raw,value=latest,enable=${{ env.IS_MAIN_BUILD == 'true' }}
+            type=raw,value=latest,enable=${{ env.IS_RELEASE == 'true' }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
+            type=raw,value=dev,enable=${{ env.IS_DEV_BUILD == 'true' }}
             type=raw,value=pr-${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
             type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
-            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/tags/release' && github.ref != 'refs/tags/dev' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
