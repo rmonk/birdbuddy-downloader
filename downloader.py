@@ -39,6 +39,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from xml.sax.saxutils import escape as xml_escape
 import aiohttp
 from aiohttp import web
 import cv2
@@ -85,7 +86,9 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     sharpness_score REAL,
     is_deleted INTEGER DEFAULT 0,
     trash_path TEXT,
-    deleted_at TEXT
+    deleted_at TEXT,
+    location_city TEXT,
+    location_country TEXT
 );
 """
 
@@ -126,6 +129,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
             cursor.execute("ALTER TABLE downloaded_media ADD COLUMN trash_path TEXT")
         if "deleted_at" not in existing_cols:
             cursor.execute("ALTER TABLE downloaded_media ADD COLUMN deleted_at TEXT")
+        if "location_city" not in existing_cols:
+            cursor.execute("ALTER TABLE downloaded_media ADD COLUMN location_city TEXT")
+        if "location_country" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE downloaded_media ADD COLUMN location_country TEXT"
+            )
 
         # Create indexes after ensuring all columns exist
         conn.execute(
@@ -293,15 +302,17 @@ def record_media_downloaded(
     bird_score: float | None = None,
     bird_detected: int = 0,
     sharpness_score: float | None = None,
+    location_city: str | None = None,
+    location_country: str | None = None,
 ):
     """Record media item in database after successful download."""
     now_iso = datetime.now(timezone.utc).isoformat()
     with conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO downloaded_media 
-            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path, sighting_id, bird_score, bird_detected, sharpness_score, is_deleted, trash_path, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+            INSERT OR REPLACE INTO downloaded_media
+            (media_id, feeder_id, feeder_name, species_name, media_type, created_at, downloaded_at, file_path, sighting_id, bird_score, bird_detected, sharpness_score, is_deleted, trash_path, deleted_at, location_city, location_country)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
             """,
             (
                 media_id,
@@ -316,7 +327,26 @@ def record_media_downloaded(
                 bird_score,
                 bird_detected,
                 sharpness_score,
+                location_city,
+                location_country,
             ),
+        )
+
+
+def update_media_location(
+    conn: sqlite3.Connection,
+    media_id: str,
+    location_city: str | None,
+    location_country: str | None,
+):
+    """Fill in missing location columns on an existing downloaded media record."""
+    if not location_city and not location_country:
+        return
+    with conn:
+        conn.execute(
+            "UPDATE downloaded_media SET location_city = COALESCE(location_city, ?), "
+            "location_country = COALESCE(location_country, ?) WHERE media_id = ?",
+            (location_city, location_country, media_id),
         )
 
 
@@ -358,6 +388,7 @@ def soft_delete_media(
         except Exception as e:
             logger.error(f"Failed to move {file_path} to {target_trash_path}: {e}")
             return False
+        move_xmp_sidecar(file_path, target_trash_path)
     else:
         target_trash_path = None
 
@@ -405,6 +436,7 @@ def restore_media(conn: sqlite3.Connection, download_dir: str, media_id: str) ->
     except Exception as e:
         logger.error(f"Failed to restore {trash_path} to {file_path}: {e}")
         return False
+    move_xmp_sidecar(trash_path, file_path)
 
     with conn:
         conn.execute(
@@ -460,6 +492,15 @@ def cleanup_old_db_records(conn: sqlite3.Connection, retention_days: int = 14) -
                     logger.warning(
                         f"Could not remove aged trash file {trash_path}: {e}"
                     )
+            if is_del and trash_path:
+                sidecar = xmp_sidecar_path(trash_path)
+                if os.path.exists(sidecar):
+                    try:
+                        os.remove(sidecar)
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not remove aged trash sidecar {sidecar}: {e}"
+                        )
 
     if to_delete:
         cursor.executemany(
@@ -747,6 +788,168 @@ def apply_timestamps_and_exif(file_path: str, dt: datetime, is_image: bool):
             logger.debug(f"Could not write EXIF metadata to {file_path}: {e}")
 
 
+XMP_TAG_ROOT = "Bird Buddy"
+XMP_BBD_NS = "https://github.com/rmonk/birdbuddy-downloader/ns/1.0/"
+
+
+def feeder_location(feeder: dict | None) -> tuple[str | None, str | None]:
+    """Return (city, country) for a feeder dict.
+
+    Owner feeders nest it as location{city,country}; member feeders and
+    collection media nodes use flat locationCity/locationCountry.
+    """
+    if not feeder:
+        return None, None
+    nested = feeder.get("location") or {}
+    city = nested.get("city") or feeder.get("locationCity") or None
+    country = nested.get("country") or feeder.get("locationCountry") or None
+    return city, country
+
+
+def xmp_sidecar_path(file_path: str) -> str:
+    """Sidecar path next to the media file (<file>.xmp, as Immich and digiKam expect)."""
+    return file_path + ".xmp"
+
+
+def move_xmp_sidecar(src_media_path: str, dst_media_path: str):
+    """Move a media file's sidecar to follow the media file, if one exists."""
+    src = xmp_sidecar_path(src_media_path)
+    if not os.path.exists(src):
+        return
+    try:
+        shutil.move(src, xmp_sidecar_path(dst_media_path))
+    except Exception as e:
+        logger.warning(f"Could not move XMP sidecar {src}: {e}")
+
+
+def build_xmp_tags(
+    species_name: str, feeder_name: str, location_city: str | None
+) -> list[str]:
+    """Hierarchical tags, e.g. 'Bird Buddy/Species/House Finch'."""
+
+    def part(s: str) -> str:
+        return s.replace("/", "-").replace("|", "-").strip()
+
+    tags = [f"{XMP_TAG_ROOT}/Species/{part(species_name or 'Unknown Species')}"]
+    if feeder_name:
+        tags.append(f"{XMP_TAG_ROOT}/Feeder/{part(feeder_name)}")
+    if location_city:
+        tags.append(f"{XMP_TAG_ROOT}/City/{part(location_city)}")
+    return tags
+
+
+def build_xmp_description(
+    species_name: str,
+    feeder_name: str,
+    location_city: str | None,
+    location_country: str | None,
+    dt: datetime | None,
+) -> str:
+    """One-line caption, e.g. 'House Finch at Bird Buddy feeder "Backyard" (Springfield, US), 2026-10-14 08:46 PDT.'"""
+    where = "Bird Buddy feeder"
+    if feeder_name:
+        where += f' "{feeder_name}"'
+    location = ", ".join(p for p in (location_city, location_country) if p)
+    if location:
+        where += f" ({location})"
+    text = f"{species_name or 'Unknown Species'} at {where}"
+    if dt:
+        text += f", {dt.astimezone().strftime('%Y-%m-%d %H:%M %Z')}"
+    return text + "."
+
+
+def build_xmp_sidecar(
+    media_id: str,
+    dt: datetime | None,
+    species_name: str,
+    feeder_name: str,
+    location_city: str | None = None,
+    location_country: str | None = None,
+    sighting_id: str | None = None,
+) -> str:
+    """Render an XMP sidecar with capture time, caption, location and tags.
+
+    Tags go in digiKam:TagsList (digiKam, Immich), lr:hierarchicalSubject
+    (Lightroom) and flat dc:subject keywords (most other photo apps).
+    """
+    tags = build_xmp_tags(species_name, feeder_name, location_city)
+    keywords = list(dict.fromkeys(t.rsplit("/", 1)[-1] for t in tags))
+    description = build_xmp_description(
+        species_name, feeder_name, location_city, location_country, dt
+    )
+
+    lines = [
+        "<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>",
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'>",
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>",
+        "<rdf:Description rdf:about=''"
+        " xmlns:dc='http://purl.org/dc/elements/1.1/'"
+        " xmlns:exif='http://ns.adobe.com/exif/1.0/'"
+        " xmlns:xmp='http://ns.adobe.com/xap/1.0/'"
+        " xmlns:photoshop='http://ns.adobe.com/photoshop/1.0/'"
+        " xmlns:digiKam='http://www.digikam.org/ns/1.0/'"
+        " xmlns:lr='http://ns.adobe.com/lightroom/1.0/'"
+        f" xmlns:bbd='{XMP_BBD_NS}'>",
+    ]
+    if dt:
+        # XMP dates are ISO 8601 with the offset, in the local timezone like EXIF.
+        stamp = xml_escape(dt.astimezone().isoformat(timespec="seconds"))
+        lines += [
+            f"<exif:DateTimeOriginal>{stamp}</exif:DateTimeOriginal>",
+            f"<xmp:CreateDate>{stamp}</xmp:CreateDate>",
+            f"<photoshop:DateCreated>{stamp}</photoshop:DateCreated>",
+        ]
+    if location_city:
+        lines.append(f"<photoshop:City>{xml_escape(location_city)}</photoshop:City>")
+    if location_country:
+        lines.append(
+            f"<photoshop:Country>{xml_escape(location_country)}</photoshop:Country>"
+        )
+    lines.append(
+        "<dc:description><rdf:Alt><rdf:li xml:lang='x-default'>"
+        f"{xml_escape(description)}</rdf:li></rdf:Alt></dc:description>"
+    )
+    lines.append("<dc:subject><rdf:Bag>")
+    lines += [f"<rdf:li>{xml_escape(k)}</rdf:li>" for k in keywords]
+    lines.append("</rdf:Bag></dc:subject>")
+    lines.append("<digiKam:TagsList><rdf:Seq>")
+    lines += [f"<rdf:li>{xml_escape(t)}</rdf:li>" for t in tags]
+    lines.append("</rdf:Seq></digiKam:TagsList>")
+    lines.append("<lr:hierarchicalSubject><rdf:Bag>")
+    lines += [f"<rdf:li>{xml_escape(t.replace('/', '|'))}</rdf:li>" for t in tags]
+    lines.append("</rdf:Bag></lr:hierarchicalSubject>")
+    lines.append(f"<bbd:MediaID>{xml_escape(media_id)}</bbd:MediaID>")
+    if sighting_id:
+        lines.append(f"<bbd:SightingID>{xml_escape(sighting_id)}</bbd:SightingID>")
+    lines += [
+        "</rdf:Description>",
+        "</rdf:RDF>",
+        "</x:xmpmeta>",
+        "<?xpacket end='w'?>",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_xmp_sidecar(media_path: str, xmp: str) -> bool:
+    """Write the sidecar atomically next to media_path. Returns True on success."""
+    sidecar = xmp_sidecar_path(media_path)
+    temp_path = sidecar + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(xmp)
+        os.replace(temp_path, sidecar)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not write XMP sidecar {sidecar}: {e}")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return False
+
+
 async def download_file(url: str, dest_path: str, stop_checker=None) -> bool:
     """Download file from URL atomically using temporary file with explicit connection and socket timeouts."""
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -1029,6 +1232,8 @@ class BirdBuddyDownloader:
         owner_name: str = "Unknown Owner",
         postcard_id: str | None = None,
         sighting_id: str | None = None,
+        location_city: str | None = None,
+        location_country: str | None = None,
     ) -> str:
         """Process and download a single media item (image or video).
         Returns status: 'downloaded', 'would_download', 'skipped', or 'filtered'.
@@ -1042,6 +1247,21 @@ class BirdBuddyDownloader:
             return "filtered"
 
         dt = parse_iso_datetime(created_at_str)
+
+        if not location_city and not location_country:
+            location_city, location_country = feeder_location(
+                self.feeders_map.get(feeder_id)
+            )
+        write_xmp = not getattr(self.args, "no_xmp", False)
+        xmp_kwargs = dict(
+            media_id=media_id,
+            dt=dt,
+            species_name=species_name,
+            feeder_name=feeder_name,
+            location_city=location_city,
+            location_country=location_country,
+            sighting_id=sighting_id or postcard_id,
+        )
 
         owner_name = owner_name or self.feeders_map.get(feeder_id, {}).get(
             "ownerName", "Unknown Owner"
@@ -1095,6 +1315,8 @@ class BirdBuddyDownloader:
                         sighting_id=sighting_id or postcard_id,
                         bird_score=bird_score,
                         bird_detected=bird_detected,
+                        location_city=location_city,
+                        location_country=location_country,
                     )
                 elif existing_bird_score is None:
                     bird_score, bird_detected = await asyncio.to_thread(
@@ -1109,6 +1331,14 @@ class BirdBuddyDownloader:
                     logger.debug(
                         f"Backfilled bird detection score for existing media {media_id}: {bird_score}"
                     )
+            if file_exists and not self.args.dry_run:
+                if is_in_db:
+                    update_media_location(
+                        self.conn, media_id, location_city, location_country
+                    )
+                if write_xmp and not os.path.exists(xmp_sidecar_path(dest_path)):
+                    if write_xmp_sidecar(dest_path, build_xmp_sidecar(**xmp_kwargs)):
+                        logger.debug(f"Backfilled XMP sidecar for media {media_id}")
             logger.debug(f"Media {media_id} already downloaded. Skipping.")
             return "skipped"
 
@@ -1131,6 +1361,8 @@ class BirdBuddyDownloader:
                 apply_timestamps_and_exif(
                     dest_path, dt, is_image=(media_type == "image")
                 )
+            if write_xmp:
+                write_xmp_sidecar(dest_path, build_xmp_sidecar(**xmp_kwargs))
             bird_score, bird_detected = (
                 await asyncio.to_thread(
                     detect_birds,
@@ -1155,6 +1387,8 @@ class BirdBuddyDownloader:
                 sighting_id=sighting_id or postcard_id,
                 bird_score=bird_score,
                 bird_detected=bird_detected,
+                location_city=location_city,
+                location_country=location_country,
             )
             score_str = (
                 f" (Bird Likelihood: {int(bird_score * 100)}%)"
@@ -1248,6 +1482,7 @@ class BirdBuddyDownloader:
                         ) or self.feeders_map.get(feeder_id, {}).get(
                             "ownerName", "Unknown Owner"
                         )
+                        feeder_city, feeder_country = feeder_location(feeder_info)
 
                         sighting_id = None
                         if (
@@ -1294,6 +1529,8 @@ class BirdBuddyDownloader:
                                     owner_name,
                                     postcard_id,
                                     sighting_id,
+                                    location_city=feeder_city,
+                                    location_country=feeder_country,
                                 )
                                 if status == "downloaded":
                                     total_downloaded += 1
@@ -1333,6 +1570,8 @@ class BirdBuddyDownloader:
                                     owner_name,
                                     postcard_id,
                                     sighting_id,
+                                    location_city=feeder_city,
+                                    location_country=feeder_country,
                                 )
                                 if status == "downloaded":
                                     total_downloaded += 1
@@ -1493,6 +1732,8 @@ class BirdBuddyDownloader:
                             feeder_id,
                             species,
                             owner_name,
+                            location_city=cnode.get("locationCity"),
+                            location_country=cnode.get("locationCountry"),
                         )
                         if status == "downloaded":
                             total_downloaded += 1
@@ -3611,6 +3852,12 @@ def parse_args():
         action="store_true",
         default=str_to_bool(os.getenv("NO_DETECT", "false")),
         help="Skip bird detection likelihood scoring on downloaded images",
+    )
+    parser.add_argument(
+        "--no-xmp",
+        action="store_true",
+        default=str_to_bool(os.getenv("NO_XMP", "false")),
+        help="Do not write <file>.xmp metadata sidecars next to downloaded media (or NO_XMP env var)",
     )
     parser.add_argument(
         "-v",

@@ -11,6 +11,7 @@ This document provides architectural context, development guidelines, CLI flags,
 ### Core Capabilities
 - **De-Duplication**: Tracks downloaded media items in a local SQLite database (`birdbuddy_downloader.db`).
 - **Timestamp & EXIF Preservation**: Sets file `mtime`/`atime` and embeds EXIF date metadata into downloaded JPEG images.
+- **XMP Sidecars**: Writes `<file>.xmp` next to each photo/video with capture time, caption, feeder city/country, hierarchical `Bird Buddy/{Species,Feeder,City}/…` tags and media/sighting IDs (`--no-xmp` to disable).
 - **Custom Templating**: Dynamic subdirectory (`--dir-template`) and filename (`--filename-template`) generation with support for detection/postcard event grouping (`{detection_id}`, `{postcard_id}`, `{sighting_id}`).
 - **Incremental Syncing**: Uses the latest DB capture timestamp minus a 2-hour buffer (`--buffer-hours 2.0`) as the cutoff point to halt feed pagination early for maximum efficiency.
 - **Automated Database Cleanup**: Automatically purges database records older than 14 days (`--db-retention-days 14`) after each run.
@@ -88,7 +89,9 @@ CREATE TABLE IF NOT EXISTS downloaded_media (
     sharpness_score REAL,
     is_deleted INTEGER DEFAULT 0,
     trash_path TEXT,
-    deleted_at TEXT
+    deleted_at TEXT,
+    location_city TEXT,
+    location_country TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_downloaded_at ON downloaded_media(downloaded_at);
 CREATE INDEX IF NOT EXISTS idx_feeder_name ON downloaded_media(feeder_name);
@@ -126,6 +129,8 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 - `get_latest_download_timestamp()`: Finds the max `created_at` timestamp in SQLite to calculate the incremental sync cutoff.
 - `build_template_vars()`: Generates a dictionary of metadata placeholders (`feeder_name`, `species_name`, `detection_id`, `postcard_id`, `sighting_id`, `year`, `month`, `day`, `media_id_short`, etc.).
 - `render_dest_path()`: Safely formats directory and filename strings using `SafeDict` to prevent `KeyError` crashes, sanitizes path components, and ensures correct extensions (`.jpg`/`.mp4`).
+- `feeder_location()`: Returns `(city, country)` from a feeder dict (nested `location{city,country}` for owner feeders, flat `locationCity`/`locationCountry` for member feeders and collection media nodes). `process_media_item()` falls back to `feeders_map[feeder_id]` when the caller passes no location.
+- `build_xmp_sidecar()` / `write_xmp_sidecar()`: Render and atomically write the `<file>.xmp` sidecar. `process_media_item()` writes it after download and backfills a missing sidecar (and missing location columns via `update_media_location()`) for files already on disk. `soft_delete_media()`, `restore_media()` and `cleanup_old_db_records()` move or purge the sidecar together with its media file via `move_xmp_sidecar()`.
 - `download_file()`: Downloads files atomically to `.tmp` files first with explicit socket timeouts, replacing destination upon completion.
 - `apply_timestamps_and_exif()`: Writes EXIF `DateTimeOriginal`, `DateTimeDigitized`, `DateTime` in the local timezone (`TZ`) with the matching `OffsetTime`/`OffsetTimeOriginal`/`OffsetTimeDigitized` tags, and updates file system modification time (`os.utime`).
 
@@ -147,6 +152,7 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 | `--min-bird-confidence` | `0.25` | Minimum detection confidence threshold to count as a bird match |
 | `--model-path` | `models/yolo26n.onnx` | Path to ONNX object detection model for bird identification |
 | `--no-detect` | `False` | Skip bird detection likelihood scoring on downloaded images |
+| `--no-xmp` | `False` | Do not write `<file>.xmp` metadata sidecars (or `NO_XMP` env var) |
 | `--full-sync` | `False` | Bypass incremental cutoff and perform a full feed sync |
 | `--interval` | `0` | Polling interval in seconds (0 = single run) |
 | `--max-pages` | `0` | Max feed pages to fetch (0 = unlimited) |
