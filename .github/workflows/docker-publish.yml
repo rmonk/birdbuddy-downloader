@@ -6,6 +6,8 @@ on:
       - main
     tags:
       - 'v*.*.*'
+      # Moving `dev` tag: builds the tagged commit as :dev only (no :latest, no version tag)
+      - 'dev'
   pull_request:
     branches:
       - main
@@ -65,6 +67,7 @@ jobs:
       contents: write
     env:
       IS_MAIN_BUILD: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+      IS_DEV_BUILD: ${{ github.event_name == 'push' && github.ref == 'refs/tags/dev' }}
 
     steps:
       - name: Checkout repository
@@ -124,6 +127,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ env.IS_MAIN_BUILD == 'true' }}
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
+            type=raw,value=dev,enable=${{ env.IS_DEV_BUILD == 'true' }}
             type=raw,value=pr-${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
             type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
             type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' }}

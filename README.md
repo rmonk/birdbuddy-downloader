@@ -148,6 +148,10 @@ A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`
 - **`main` Branch**: Tagged with `:latest` and a date-based build version `:YYYYMMDDNN` (UTC date plus a two-digit daily build number starting at `01`, e.g. `:2026092801`) on every merge/push to `main`. A matching git tag is created for each build.
 - **Pull Requests**: Tagged with `:pr-<branch_name>` and `:pr-<pr_number>` for pull requests originating from source branches within this repository only when the latest PR commit has a `stage` git tag (never built or published for forks).
 - **Release Tags**: Tagged with semantic version tags (e.g. `:v1.0.0`, `:v1.0`).
+- **`dev` Tag**: Pushing the git tag `dev` builds that commit and publishes it as `:dev` only, for testing before a release. It never gets `:latest` or a version tag. `dev` is a moving tag, so force-push it to move it to the current `main`:
+  ```bash
+  git fetch origin && git tag -f dev origin/main && git push -f origin dev
+  ```
 
 **Required GitHub Repository Secrets**:
 - `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).
