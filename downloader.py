@@ -1120,6 +1120,45 @@ def render_dest_path(
     return formatted_dir, formatted_filename, dest_path
 
 
+# One feed item with its feeder and photos/video. The stock feed query leaves
+# medias out, and asking for them on a whole page fails if any one item on it
+# can't be rendered, so the fallback below asks for a single item.
+FEED_ITEM_MEDIAS_QUERY = """
+query meFeedItemMedias($after: String) {
+  me {
+    feed(first: 1, after: $after) {
+      edges {
+        node {
+          __typename
+          ... on FeedItemNewPostcard {
+            id
+            feeder {
+              __typename
+              ... on Feeder {
+                id
+                name
+              }
+            }
+            medias {
+              __typename
+              id
+              createdAt
+              ... on MediaImage {
+                contentUrl(size: ORIGINAL)
+              }
+              ... on MediaVideo {
+                contentUrl(size: ORIGINAL)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 class BirdBuddyDownloader:
 
     def __init__(self, args, conn: sqlite3.Connection):
@@ -1401,6 +1440,26 @@ class BirdBuddyDownloader:
             return "downloaded"
         return "filtered"
 
+    async def postcard_from_feed(
+        self, postcard_id: str, after_cursor: str | None
+    ) -> dict | None:
+        """Read a new postcard's feeder and media straight from the feed.
+
+        Opening a postcard (sightingCreateFromPostcard) fails with
+        INTERNAL_SERVER_ERROR on some postcards whose photos and video the
+        feed still lists. This reads them without opening it: the one feed
+        item after after_cursor (the cursor of the item before it, or None
+        for the first item).
+        """
+        data = await self.bb._make_request(
+            query=FEED_ITEM_MEDIAS_QUERY, variables={"after": after_cursor}
+        )
+        for edge in data["me"]["feed"]["edges"]:
+            node = edge.get("node") or {}
+            if node.get("id") == postcard_id:
+                return node
+        return None
+
     async def sync_feed(self) -> int:
         """Sync media items from Bird Buddy feed across all cameras. Returns count of newly downloaded items."""
         mode_str = " (Dry-Run mode)" if self.args.dry_run else ""
@@ -1448,7 +1507,10 @@ class BirdBuddyDownloader:
                 break
 
             logger.info(f"Processing feed page {page} ({len(edges)} items)...")
+            prev_cursor = cursor
             for edge in edges:
+                # The cursor just before this item, for postcard_from_feed.
+                item_cursor, prev_cursor = prev_cursor, edge.get("cursor")
                 if self.stop_requested:
                     logger.info("Stop requested. Halting feed processing.")
                     break
@@ -1472,8 +1534,10 @@ class BirdBuddyDownloader:
 
                 if node_type == "FeedItemNewPostcard":
                     postcard_id = node.get("id")
+                    opened = False
                     try:
                         sighting = await self.bb.sighting_from_postcard(postcard_id)
+                        opened = True
                         feeder_info = (sighting.feeder if sighting else {}) or {}
                         feeder_id = feeder_info.get("id", "unknown_feeder")
                         feeder_name = feeder_info.get("name", "Unknown Feeder")
@@ -1583,7 +1647,69 @@ class BirdBuddyDownloader:
                     except Exception as e:
                         if self.stop_requested:
                             break
-                        logger.error(f"Error processing postcard {postcard_id}: {e}")
+                        if opened:
+                            # Opened but not saved: refiling it under an
+                            # unknown species would stick via the de-dup DB.
+                            logger.error(
+                                f"Error processing postcard {postcard_id}: {e}"
+                            )
+                            continue
+                        logger.warning(
+                            f"Could not open postcard {postcard_id} ({e}). "
+                            "Reading its media from the feed instead."
+                        )
+                        # One boundary for the whole fallback: an error here
+                        # skips this postcard, not the rest of the sync.
+                        try:
+                            card = await self.postcard_from_feed(
+                                postcard_id, item_cursor
+                            )
+                            if not card:
+                                logger.error(
+                                    f"Postcard {postcard_id} is no longer in the feed."
+                                )
+                                continue
+
+                            # Unopened, so the species is unknown.
+                            feeder_info = card.get("feeder") or {}
+                            feeder_id = feeder_info.get("id", "unknown_feeder")
+                            feeder_name = feeder_info.get("name", "Unknown Feeder")
+                            if (
+                                self.args.feeder_filter
+                                and self.args.feeder_filter.lower()
+                                not in feeder_name.lower()
+                            ):
+                                continue
+                            owner_name = self.feeders_map.get(feeder_id, {}).get(
+                                "ownerName", "Unknown Owner"
+                            )
+                            for m in card.get("medias") or []:
+                                if self.stop_requested:
+                                    break
+                                is_video = m.get("__typename") == "MediaVideo"
+                                status = await self.process_media_item(
+                                    m.get("id"),
+                                    "video" if is_video else "image",
+                                    m.get("contentUrl"),
+                                    m.get("createdAt"),
+                                    feeder_name,
+                                    feeder_id,
+                                    "Unrecognized Species",
+                                    owner_name,
+                                    postcard_id,
+                                )
+                                if status == "downloaded":
+                                    total_downloaded += 1
+                                elif status == "would_download":
+                                    total_would_download += 1
+                                elif status == "skipped":
+                                    total_skipped += 1
+                        except Exception as e:
+                            if self.stop_requested:
+                                break
+                            logger.error(
+                                f"Error processing postcard {postcard_id}: {e}"
+                            )
 
                 elif node_type in [
                     "FeedItemCollectedPostcard",
@@ -1661,43 +1787,44 @@ class BirdBuddyDownloader:
             return 0
 
         logger.info("Checking collections...")
-        total_downloaded = 0
         try:
             data = await self.bb._make_request(query=me_queries.COLLECTIONS)
-            collections = data.get("me", {}).get("collections", [])
-            if not collections or self.stop_requested:
-                return 0
+        except Exception as e:
+            if not self.stop_requested:
+                logger.error(f"Could not fetch collections list: {e}")
+            return 0
+        collections = (data or {}).get("me", {}).get("collections", [])
+        if not collections or self.stop_requested:
+            return 0
 
-            logger.info(
-                f"Found {len(collections)} collection(s). Syncing collection media..."
-            )
-            total_would_download = 0
-            total_skipped = 0
+        logger.info(
+            f"Found {len(collections)} collection(s). Syncing collection media..."
+        )
+        total_downloaded = 0
+        total_would_download = 0
+        total_skipped = 0
+        failed = 0
 
-            for c in collections:
-                if self.stop_requested:
-                    break
-                cid = c.get("id")
-                species = (
-                    c.get("species", {}).get("name", "Unknown Species")
-                    if "species" in c
-                    else "Unknown Species"
-                )
+        for c in collections:
+            if self.stop_requested:
+                break
+            cid = c.get("id")
+            species = (c.get("species") or {}).get("name") or "Unknown Species"
+            label = f"'{species}' ({cid})"
 
-                cursor = None
+            cursor = None
+            try:
                 while not self.stop_requested:
+                    variables = {"collectionId": cid, "first": 50}
+                    # The API rejects after: null, so only send a cursor once we have one.
+                    if cursor:
+                        variables["after"] = cursor
                     media_data = await self.bb._make_request(
                         query=me_queries.COLLECTIONS_MEDIA,
-                        variables={
-                            "collectionId": cid,
-                            "first": 50,
-                            "after": cursor,
-                        },
+                        variables=variables,
                     )
-                    collection_obj = media_data.get("collection", {})
-                    media_conn = (
-                        collection_obj.get("media", {}) if collection_obj else {}
-                    )
+                    collection_obj = (media_data or {}).get("collection") or {}
+                    media_conn = collection_obj.get("media") or {}
                     edges = media_conn.get("edges", [])
                     if not edges or self.stop_requested:
                         break
@@ -1743,21 +1870,29 @@ class BirdBuddyDownloader:
                             total_skipped += 1
 
                     page_info = media_conn.get("pageInfo", {})
-                    if not page_info.get("hasNextPage") or self.stop_requested:
+                    next_cursor = page_info.get("endCursor")
+                    if (
+                        not page_info.get("hasNextPage")
+                        or not next_cursor
+                        or next_cursor == cursor
+                    ):
                         break
-                    cursor = page_info.get("endCursor")
+                    cursor = next_cursor
+            except Exception as e:
+                if self.stop_requested:
+                    break
+                failed += 1
+                logger.warning(f"Collection {label} sync failed: {e}")
 
-            if self.args.dry_run:
-                logger.info(
-                    f"[DRY-RUN COLLECTIONS SUMMARY] Would download: {total_would_download} item(s) | Skipped: {total_skipped} item(s)"
-                )
-            else:
-                logger.info(
-                    f"Collections sync complete. New media downloaded: {total_downloaded}"
-                )
-        except Exception as e:
-            if not self.stop_requested:
-                logger.debug(f"Collections sync skipped or encountered error: {e}")
+        failed_str = f" | Failed collections: {failed}" if failed else ""
+        if self.args.dry_run:
+            logger.info(
+                f"[DRY-RUN COLLECTIONS SUMMARY] Would download: {total_would_download} item(s) | Skipped: {total_skipped} item(s){failed_str}"
+            )
+        else:
+            logger.info(
+                f"Collections sync complete. New media downloaded: {total_downloaded}{failed_str}"
+            )
         return total_downloaded
 
     async def get_account_info(self) -> dict:
