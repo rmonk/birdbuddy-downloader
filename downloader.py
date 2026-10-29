@@ -179,8 +179,13 @@ def get_bird_detector_net(model_path: str | None = None):
     env_path = os.getenv("BIRD_MODEL_PATH")
     if env_path:
         candidate_paths.append(env_path)
+    # yolo26l is the default (see "Bird Detection Model Selection" in README.md);
+    # the smaller models remain as fallbacks for existing local installs.
     candidate_paths.extend(
         [
+            "/app/models/yolo26l.onnx",
+            "models/yolo26l.onnx",
+            os.path.join(os.path.dirname(__file__), "models", "yolo26l.onnx"),
             "/app/models/yolo26n.onnx",
             "models/yolo26n.onnx",
             os.path.join(os.path.dirname(__file__), "models", "yolo26n.onnx"),
@@ -204,6 +209,27 @@ def get_bird_detector_net(model_path: str | None = None):
 
     logger.debug("No bird detection model found; bird likelihood scoring disabled.")
     return None
+
+
+YOLO_INPUT_SIZE = 640
+YOLO_PAD_VALUE = 114
+
+
+def letterbox_blob(img: np.ndarray, size: int = YOLO_INPUT_SIZE) -> np.ndarray:
+    """Scale the long side to `size`, pad to a square and return a YOLO input blob.
+
+    Keeps the aspect ratio, as the YOLO models were trained. Stretching a
+    portrait Bird Buddy photo to a square distorts the bird and cuts detection
+    rates sharply.
+    """
+    h, w = img.shape[:2]
+    scale = size / max(h, w)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((size, size, 3), YOLO_PAD_VALUE, dtype=np.uint8)
+    top, left = (size - new_h) // 2, (size - new_w) // 2
+    canvas[top : top + new_h, left : left + new_w] = resized
+    return cv2.dnn.blobFromImage(canvas, 1.0 / 255.0, (size, size), swapRB=True)
 
 
 def detect_birds(
@@ -230,11 +256,8 @@ def detect_birds(
         if img is None:
             return None, 0
 
-        # Preprocess image for YOLO (640x640, BGR->RGB, scale 1/255.0)
-        blob = cv2.dnn.blobFromImage(
-            img, 1.0 / 255.0, (640, 640), swapRB=True, crop=False
-        )
-        net.setInput(blob)
+        # Letterbox to 640x640 (BGR->RGB, scale 1/255.0)
+        net.setInput(letterbox_blob(img))
         output = net.forward()
 
         # YOLOv8 output shape: [1, 84, 8400]
@@ -3979,8 +4002,8 @@ def parse_args():
     )
     parser.add_argument(
         "--model-path",
-        default=os.getenv("BIRD_MODEL_PATH", "models/yolo26n.onnx"),
-        help="Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)",
+        default=os.getenv("BIRD_MODEL_PATH", "models/yolo26l.onnx"),
+        help="Path to ONNX object detection model for bird identification (default: models/yolo26l.onnx or BIRD_MODEL_PATH env var)",
     )
     parser.add_argument(
         "--no-detect",
