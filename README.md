@@ -29,6 +29,14 @@ An automated python utility to download images and videos from all Bird Buddy ca
   - Sets the file modification time (`mtime` / `atime`) on all images and videos to match the capture timestamp from Bird Buddy metadata.
   - Embeds EXIF metadata (`DateTime`, `DateTimeOriginal`, `DateTimeDigitized`) into JPEG image files, written in the local timezone with the matching `OffsetTime*` tags so photo libraries such as Immich show the correct local capture time. Set `TZ` (e.g. `TZ=America/New_York`) to the feeder's timezone. When `TZ` is unset, native runs use the system timezone and containers use UTC.
   - Only newly downloaded photos get local times and offset tags. Photos downloaded before this change keep the UTC wall time they were written with, and are not rewritten.
+- **XMP Sidecars**: Writes a `<file>.xmp` sidecar next to every photo and video, read by Immich, digiKam, darktable and Lightroom. It holds:
+  - the capture time (local timezone with offset), which also covers videos, since EXIF only goes into JPEGs;
+  - a caption such as `House Finch at Bird Buddy feeder "Backyard" (Springfield, United States), 2026-10-14 08:46 EDT.`;
+  - the feeder's city and country (`photoshop:City` / `photoshop:Country`);
+  - hierarchical tags `Bird Buddy/Species/<name>`, `Bird Buddy/Feeder/<name>` and `Bird Buddy/City/<city>` (`digiKam:TagsList`, `lr:hierarchicalSubject` and flat `dc:subject` keywords);
+  - the Bird Buddy media ID and sighting ID (`bbd:MediaID`, `bbd:SightingID`).
+
+  Unlike the database, this metadata stays with the file after `--db-retention-days` prunes old records. Sidecars move with their media on delete and restore. Files that were already downloaded get a sidecar the next time a sync sees them (use `--full-sync` to backfill everything). Disable with `--no-xmp` / `NO_XMP=true`. Bird Buddy only reports a city name, so the sidecar has no GPS coordinates.
 - **Flexible Execution**:
   - **Single-run mode**: Ideal for running via `cron` or `systemd` timers.
   - **Continuous daemon mode**: Polls periodically on a schedule (`--interval 3600`).
@@ -243,7 +251,7 @@ usage: downloader.py [-h] [--env-file ENV_FILE] [--username USERNAME]
                      [--web-public-url WEB_PUBLIC_URL]
                      [--reset-password USERNAME] [--no-web]
                      [--min-bird-confidence MIN_BIRD_CONFIDENCE]
-                     [--model-path MODEL_PATH] [--no-detect] [-v]
+                     [--model-path MODEL_PATH] [--no-detect] [--no-xmp] [-v]
 
 Automatic Bird Buddy media downloader with de-duplication, metadata timestamping, web dashboard, and feeder info.
 
@@ -285,6 +293,7 @@ options:
   --model-path MODEL_PATH
                         Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)
   --no-detect           Skip bird detection likelihood scoring on downloaded images
+  --no-xmp              Do not write <file>.xmp metadata sidecars next to downloaded media (or NO_XMP env var)
   -v, --verbose         Enable debug logging
 ```
 

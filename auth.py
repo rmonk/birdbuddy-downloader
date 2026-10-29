@@ -1251,6 +1251,12 @@ SETTINGS_SPEC = {
         "help": "Skip bird likelihood scoring on downloaded images.",
         "parse": _parse_bool,
     },
+    "no_xmp": {
+        "label": "Disable XMP sidecars",
+        "type": "bool",
+        "help": "Do not write <file>.xmp metadata sidecars next to downloaded media.",
+        "parse": _parse_bool,
+    },
 }
 
 _DEFAULTS_ATTR = "_settings_defaults"
