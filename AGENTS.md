@@ -120,7 +120,7 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 
 ### Key Functions & Classes
 - `BirdBuddyDownloader`: Main orchestrator class handling authentication, API queries, feed pagination, state tracking, and media downloading.
-- `detect_birds()`: Analyzes downloaded images via OpenCV DNN (`cv2.dnn`) with a lightweight ONNX YOLO object detector to calculate bird presence likelihood and confidence score.
+- `detect_birds()`: Analyzes downloaded images via OpenCV DNN (`cv2.dnn`) with an ONNX YOLO object detector (default YOLO26-L, COCO class 14 = bird) to calculate bird presence likelihood and confidence score. Images are letterboxed by `letterbox_blob()` (aspect ratio kept, gray padding), never stretched; stretching cut detection rates sharply in testing (see README "Bird Detection Model Selection").
 - `get_recent_sightings()`: Queries media from the past 7 days grouped by `sighting_id`, tagging the highest bird likelihood photo (`is_best_view = True`) per sighting and tracking active vs removed items.
 - `soft_delete_media()` / `restore_media()`: Safely moves deleted files to `.trash/` or restores them to original path.
 - `cleanup_old_db_records()`: Purges records older than `--db-retention-days` (default 14 days); permanently removes aged `.trash/` files from disk while preserving active files.
@@ -150,7 +150,7 @@ Auth tables (created by `auth.init_auth_db()`, see `AUTH_SCHEMA` in `auth.py`):
 | `--buffer-hours` | `2.0` | Hours before latest downloaded detection to start fetching feed items |
 | `--db-retention-days` | `14` | Days to retain records in database before cleanup (0 to disable) |
 | `--min-bird-confidence` | `0.25` | Minimum detection confidence threshold to count as a bird match |
-| `--model-path` | `models/yolo26n.onnx` | Path to ONNX object detection model for bird identification |
+| `--model-path` | `models/yolo26l.onnx` | Path to ONNX object detection model for bird identification |
 | `--no-detect` | `False` | Skip bird detection likelihood scoring on downloaded images |
 | `--no-xmp` | `False` | Do not write `<file>.xmp` metadata sidecars (or `NO_XMP` env var) |
 | `--full-sync` | `False` | Bypass incremental cutoff and perform a full feed sync |

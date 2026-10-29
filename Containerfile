@@ -1,4 +1,4 @@
-# Stage 1: Export lightweight YOLO nano ONNX model for bird detection
+# Stage 1: Export the YOLO26-L ONNX model for bird detection (see README: Bird Detection Model Selection)
 FROM python:3.11-slim AS model-builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
     pip install --no-cache-dir ultralytics onnx && \
-    python3 -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
+    python3 -c "from ultralytics import YOLO; YOLO('yolo26l.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
 
 # Stage 2: Final runtime container image
 FROM python:3.11-slim
@@ -28,9 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bundled YOLO nano ONNX model from builder stage
+# Copy bundled YOLO26-L ONNX model from builder stage
 RUN mkdir -p /app/models
-COPY --from=model-builder /build/yolo26n.onnx /app/models/yolo26n.onnx
+COPY --from=model-builder /build/yolo26l.onnx /app/models/yolo26l.onnx
 
 # Copy downloader application script
 COPY downloader.py auth.py ./

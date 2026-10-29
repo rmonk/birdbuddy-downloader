@@ -43,7 +43,7 @@ An automated python utility to download images and videos from all Bird Buddy ca
 - **Web Status Dashboard & Sighting Gallery**:
   - Embedded real-time web dashboard running on port `8080` (configurable via `--web-port` / `WEB_PORT`).
   - **Sighting-Based Grouping**: Media is grouped by `sighting_id` detection events over the past week (with synchronized pagination controls at the top right and bottom right of the section).
-  - **Automated Bird Detection & Likelihood Scoring**: Evaluates image bird presence and confidence via OpenCV DNN using a bundled lightweight YOLO object detection model.
+  - **Automated Bird Detection & Likelihood Scoring**: Evaluates image bird presence and confidence via OpenCV DNN using a bundled YOLO26-L object detection model on letterboxed images. See [Bird Detection Model Selection](#bird-detection-model-selection).
   - **"Best View" Highlighting**: Automatically tags and highlights the image with the highest bird detection likelihood ($\ge \text{--min-bird-confidence}$, default `0.25`) within each sighting group with a **"Best View"** badge and gold border. If all scored images fall below the confidence threshold, no image is highlighted; when detection scores are not available, the first eligible image in the group is selected.
   - **Interactive Lightbox Modal**: View full-size images or video clips directly by clicking thumbnails, including bird likelihood percentages.
   - **User Accounts & Passkeys**: Guests can browse; deleting, restoring, syncing and changing settings require login. Supports `user`/`admin` roles, passkeys (WebAuthn), per-user API keys, and an admin settings page. See [Web Dashboard Authentication](#web-dashboard-authentication).
@@ -81,13 +81,14 @@ pip install -r requirements.txt
 ```
 
 ### 4. (Optional) Provision Bird Detection Model
-When running locally outside of the container, export or place the YOLO nano ONNX model in `models/yolo26n.onnx`:
+When running locally outside of the container, export or place the YOLO26-L ONNX model in `models/yolo26l.onnx`:
 ```bash
-# Export yolo26n.onnx using ultralytics (one-time setup)
+# Export yolo26l.onnx using ultralytics (one-time setup, ~100 MB)
 python -m pip install ultralytics
-python -c "from ultralytics import YOLO; YOLO('yolo26n.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
-mkdir -p models && mv yolo26n.onnx models/yolo26n.onnx
+python -c "from ultralytics import YOLO; YOLO('yolo26l.pt').export(format='onnx', imgsz=640, opset=12, end2end=False)"
+mkdir -p models && mv yolo26l.onnx models/yolo26l.onnx
 ```
+If `models/yolo26l.onnx` is missing, the downloader falls back to `models/yolo26n.onnx` or `models/yolov8n.onnx`, which are faster but find far fewer birds (see below).
 *Note: In container deployments, the model is automatically bundled during the build. If running locally without a model, you can provide a custom path via `--model-path` / `BIRD_MODEL_PATH` or disable detection using `--no-detect`.*
 
 ### 5. Configure Credentials & Options
@@ -100,7 +101,7 @@ PASSWORD="your_password"
 # BUFFER_HOURS=2.0
 # DB_RETENTION_DAYS=14
 # MIN_BIRD_CONFIDENCE=0.25
-# BIRD_MODEL_PATH="models/yolo26n.onnx"
+# BIRD_MODEL_PATH="models/yolo26l.onnx"
 # DIR_TEMPLATE="{feeder_name}/{species_name}/{date}_{detection_id_short}"
 # FILENAME_TEMPLATE="{detection_id_short}_{id_short}.{ext}"
 ```
@@ -160,6 +161,60 @@ A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`
 **Required GitHub Repository Secrets**:
 - `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).
 - `DOCKERHUB_TOKEN`: Docker Hub Personal Access Token (PAT) with Read/Write permissions.
+
+---
+
+## Bird Detection Model Selection
+
+The bird score comes from a COCO-trained YOLO object detector (class 14, `bird`) run through OpenCV DNN on the CPU. The default is **YOLO26-L with letterboxed input**, chosen from the test below.
+
+### How it was tested
+
+- **Photos:** 150 photos picked at random from one week of real Bird Buddy captures at two feeders: 101 from a side-view window feeder, 49 from a top-down platform feeder. All are 1944×2592 portrait JPEGs straight from Bird Buddy.
+- **Labels:** each photo was checked by eye. All 150 contain a bird. 34 were marked *hard*: the bird is very close and cut off, seen from behind, motion-blurred, dark, or washed out by lens flare. The other 116 are *clear*.
+- **Measure:** a photo counts as *found* when its bird score reaches 0.25, the default `--min-bird-confidence`.
+- **Preprocessing:**
+  - *Stretch* resizes the photo straight to 640×640, squashing it. This is what the downloader did before.
+  - *Letterbox* scales the long side to 640 and pads the rest with gray, keeping the aspect ratio. This matches how the YOLO models were trained.
+- **Hardware and timing:** an idle Intel Core i7-6820HQ (4 cores / 8 threads) running OpenCV 4.10. OpenCV 5.0 gives identical scores. Each time covers JPEG decoding, preprocessing and the model, per photo, using all 8 threads.
+- **Export:** every model was exported with `imgsz=640, opset=12, end2end=False`.
+
+### Results
+
+| Model | ONNX size | Found, stretch | Found, letterbox | Score ≥ 0.50, letterbox | Clear photos found (letterbox) | Hard photos found (letterbox) | ms per photo |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| yolov8n | 13 MB | 25% | 34% | 20% | 40% | 15% | 94 |
+| yolo11n | 11 MB | 43% | 53% | 39% | 62% | 21% | 100 |
+| yolo26n *(previous default)* | 10 MB | **31%** | 37% | 21% | 42% | 18% | 104 |
+| yolov8s | 45 MB | 45% | 51% | 38% | 59% | 24% | 187 |
+| yolo11s | 38 MB | 50% | 67% | 57% | 78% | 32% | 199 |
+| yolo26s | 38 MB | 49% | 47% | 33% | 57% | 15% | 203 |
+| yolov8m | 104 MB | 70% | 75% | 65% | 87% | 32% | 383 |
+| yolo11m | 81 MB | 65% | 69% | 60% | 81% | 26% | 474 |
+| yolo26m | 82 MB | 77% | 77% | 65% | 91% | 29% | 479 |
+| **yolo26l** *(default)* | 100 MB | 81% | **90%** | **76%** | **99%** | **59%** | 592 |
+
+The ms column is the median of the stretch and letterbox runs, which never differed by more than 6 ms. Times were steady: p90 stayed within 3 ms of the median.
+
+Results by camera angle (found, at the 0.25 threshold):
+
+| | Side-view feeder (101) | Top-down feeder (49) |
+| :--- | ---: | ---: |
+| yolo26n, stretch *(previous)* | 31% | 33% |
+| yolo11s, letterbox | 72% | 57% |
+| yolo26l, letterbox *(default)* | 97% | 76% |
+
+### What the results show
+
+- **Model size matters most.** COCO's `bird` class is mostly birds seen at a distance. Close-up feeder shots look very different, so the nano and small models usually aren't confident anything is there. When they do guess, they pick classes such as `bench` (the perch), `cake` (the seed tray) or `elephant`.
+- **Letterboxing is free and usually helps.** It raised the score on more than half the photos for all 10 models, and never added time. Stretching is also misleading on a single photo: one clear close-up of a tufted titmouse scored 0.32 with the previous setup and 0.93 with YOLO26-L and letterboxing.
+- **The cost is size, not speed.** At about 0.6 s per photo, the two test feeders (~120 photos a day between them) need around a minute of CPU a day. The model file grows from 10 MB to 100 MB, and the container image grows with it.
+- **If you need a smaller model,** use `yolo11s` with `--model-path`: 38 MB, about 0.2 s per photo, 67% found.
+
+### Caveats and upgrading
+
+- Every test photo contained a bird, so false positives on empty frames weren't measured. If a larger model scores empty frames too high, raise `--min-bird-confidence`.
+- Scores already stored in the database came from the previous model and aren't recalculated. Only newly downloaded photos get new scores, so the "Best View" badge on older sightings won't change.
 
 ---
 
@@ -299,7 +354,7 @@ options:
   --min-bird-confidence MIN_BIRD_CONFIDENCE
                         Minimum detection confidence threshold to count as a bird match (default: 0.25 or MIN_BIRD_CONFIDENCE env var)
   --model-path MODEL_PATH
-                        Path to ONNX object detection model for bird identification (default: models/yolo26n.onnx or BIRD_MODEL_PATH env var)
+                        Path to ONNX object detection model for bird identification (default: models/yolo26l.onnx or BIRD_MODEL_PATH env var)
   --no-detect           Skip bird detection likelihood scoring on downloaded images
   --no-xmp              Do not write <file>.xmp metadata sidecars next to downloaded media (or NO_XMP env var)
   -v, --verbose         Enable debug logging
