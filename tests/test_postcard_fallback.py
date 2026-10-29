@@ -152,7 +152,10 @@ class PostcardFallbackTest(unittest.TestCase):
 
         self.assertEqual(downloaded, 2)
         folder = os.path.join(self.media_dir, "Unrecognized Species")
-        self.assertEqual(sorted(os.listdir(folder)), ["img-1.jpg", "vid-1.mp4"])
+        self.assertEqual(
+            sorted(os.listdir(folder)),
+            ["img-1.jpg", "img-1.jpg.xmp", "vid-1.mp4", "vid-1.mp4.xmp"],
+        )
         rows = dict(
             self.conn.execute("SELECT media_id, media_type FROM downloaded_media")
         )
@@ -177,7 +180,7 @@ class PostcardFallbackTest(unittest.TestCase):
 
         self.assertEqual(downloaded, 1)
         folder = os.path.join(self.media_dir, "Unrecognized Species")
-        self.assertEqual(os.listdir(folder), ["vid-b.mp4"])
+        self.assertEqual(sorted(os.listdir(folder)), ["vid-b.mp4", "vid-b.mp4.xmp"])
 
     def test_opened_postcard_is_not_refiled_when_saving_fails(self):
         card = postcard("pc-open", "2026-10-15T19:00:00.000Z", [video("vid-t")])
