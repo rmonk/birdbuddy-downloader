@@ -146,16 +146,16 @@ podman run --rm --env-file .env \
 
 A GitHub Actions workflow is provided at [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to automatically build multi-arch container images (`linux/amd64` and `linux/arm64`) and publish them to Docker Hub:
 - **Pull Requests**: Tagged with `:pr-<branch_name>` and `:pr-<pr_number>` for pull requests originating from source branches within this repository only when the latest PR commit has a `stage` git tag (never built or published for forks).
-- **Release Tags**: Pushing a version tag `vX.Y.Z` on a commit that is already on `main` publishes `:X.Y.Z`, `:X.Y` and `:latest`. For example, `v2.1.0` gives `:2.1.0`, `:2.1` and `:latest`. This is the only way `:latest` or a version tag is published. A pre-release such as `v2.1.0-rc.1` gets only `:2.1.0-rc.1`. A version tag on a commit that isn't on `main` fails the workflow and publishes nothing.
+- **`release` Tag**: Pushing the git tag `release` on a commit that is on `main` publishes `:latest` and a date-based build version `:YYYYMMDDNN`: the UTC date plus a two-digit build number for that day, starting at `01`, e.g. `:2026102901`. A matching `YYYYMMDDNN` git tag is created for each release. This is the only way `:latest` or a version tag is published. If `release` points at a commit that isn't on `main`, the workflow fails and publishes nothing. `release` is a moving tag, so force-push it:
   ```bash
-  git fetch origin && git tag -a v2.1.0 -m "v2.1.0" origin/main && git push origin v2.1.0
+  git fetch origin && git tag -f release origin/main && git push -f origin release
   ```
-- **`main` Branch**: Merging or pushing to `main` builds nothing. Use the `dev` tag below to test `main` before a release.
+- **`main` Branch**: Merging or pushing to `main` builds nothing. Use the `dev` tag to test `main`, and the `release` tag to publish it.
 - **`dev` Tag**: Pushing the git tag `dev` builds that commit and publishes it as `:dev` only, for testing before a release. It never gets `:latest` or a version tag. `dev` is a moving tag, so force-push it to move it to the current `main`:
   ```bash
   git fetch origin && git tag -f dev origin/main && git push -f origin dev
   ```
-- **Manual Runs** (*Run workflow* in the Actions tab): Run on a branch, it publishes `:sha-<short_sha>` only. Run on an existing release tag, it rebuilds that release under the same rules.
+- **Manual Runs** (*Run workflow* in the Actions tab): Run on the `release` or `dev` tag, it does the same as pushing that tag; on `release` that means a new `YYYYMMDDNN` release. Run on anything else, it publishes `:sha-<short_sha>` only.
 
 **Required GitHub Repository Secrets**:
 - `DOCKERHUB_USERNAME`: Your Docker Hub username (e.g. `moosemouse`).

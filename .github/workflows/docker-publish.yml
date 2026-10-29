@@ -1,15 +1,17 @@
 name: Build and Push Container Image
 
 # Published tags:
-#   v*.*.* git tag on a commit in main -> :X.Y.Z, :X.Y and :latest (no :latest for pre-releases)
-#   dev git tag (moving)               -> :dev
-#   PR with a `stage` tag on its head  -> :pr-<branch>, :pr-<number>
-#   manual run on a branch             -> :sha-<short sha>
-# Pushes to main build nothing; :latest and version tags come only from releases.
+#   release git tag (moving) on a commit in main -> :latest and :YYYYMMDDNN (+ git tag YYYYMMDDNN)
+#   dev git tag (moving)                         -> :dev
+#   PR with a `stage` tag on its head            -> :pr-<branch>, :pr-<number>
+#   manual run on release / dev                  -> same as pushing that tag
+#   manual run on anything else                  -> :sha-<short sha>
+# Pushes to main build nothing; :latest and version tags come only from the release tag.
 on:
   push:
     tags:
-      - 'v*.*.*'
+      # Moving `release` tag on a main commit: :latest + date-based :YYYYMMDDNN
+      - 'release'
       # Moving `dev` tag: builds the tagged commit as :dev only (no :latest, no version tag)
       - 'dev'
   pull_request:
@@ -19,7 +21,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Never cancel a release mid-run: its YYYYMMDDNN git tag may already be pushed.
+  cancel-in-progress: ${{ github.ref != 'refs/tags/release' }}
 
 jobs:
   check-pr-stage:
@@ -59,14 +62,14 @@ jobs:
               echo "PR commit does NOT have a 'stage' tag. Container build skipped."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          elif [ "$GITHUB_REF" = "refs/tags/release" ]; then
             # Releases (:latest and version tags) only come from commits already merged to main.
             if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-              echo "Release tag ${GITHUB_REF#refs/tags/} is on main. Proceeding with release build."
+              echo "Release tag is on main ($GITHUB_SHA). Proceeding with release build."
               IS_RELEASE=true
               echo "should_build=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::error::Release tag ${GITHUB_REF#refs/tags/} points at $GITHUB_SHA, which is not on main. Nothing was published."
+              echo "::error::The release tag points at $GITHUB_SHA, which is not on main. Nothing was published."
               exit 1
             fi
           else
@@ -81,14 +84,49 @@ jobs:
     if: needs.check-pr-stage.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Needed to push the YYYYMMDDNN git tag for releases.
+      contents: write
     env:
       IS_RELEASE: ${{ needs.check-pr-stage.outputs.is_release }}
-      IS_DEV_BUILD: ${{ github.event_name == 'push' && github.ref == 'refs/tags/dev' }}
+      IS_DEV_BUILD: ${{ github.event_name != 'pull_request' && github.ref == 'refs/tags/dev' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Reserve date-based build version
+        id: version
+        if: env.IS_RELEASE == 'true'
+        run: |
+          # Version format: YYYYMMDDNN (UTC date + two-digit daily build number starting at 01).
+          # The git tag is pushed before building so concurrent runs can never claim the same number.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          DATE=$(date -u +%Y%m%d)
+          for attempt in $(seq 1 5); do
+            git fetch --tags --force --quiet origin
+            LAST=$(git tag -l "${DATE}[0-9][0-9]" | sort | tail -n 1)
+            if [ -z "$LAST" ]; then
+              NEXT=1
+            else
+              NEXT=$((10#${LAST:8:2} + 1))
+            fi
+            if [ "$NEXT" -gt 99 ]; then
+              echo "::error::Daily build limit (99) reached for ${DATE}"
+              exit 1
+            fi
+            VERSION=$(printf '%s%02d' "$DATE" "$NEXT")
+            git tag -a "$VERSION" -m "Build $VERSION" "$GITHUB_SHA"
+            if git push origin "refs/tags/$VERSION"; then
+              echo "Reserved build version $VERSION"
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Tag $VERSION already taken, retrying..."
+            git tag -d "$VERSION"
+          done
+          echo "::error::Could not reserve a build version after 5 attempts"
+          exit 1
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -111,13 +149,12 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},enable=${{ env.IS_RELEASE == 'true' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ env.IS_RELEASE == 'true' }}
-            type=raw,value=latest,enable=${{ env.IS_RELEASE == 'true' && !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ env.IS_RELEASE == 'true' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
             type=raw,value=dev,enable=${{ env.IS_DEV_BUILD == 'true' }}
             type=raw,value=pr-${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
             type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
-            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/tags/release' && github.ref != 'refs/tags/dev' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
