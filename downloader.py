@@ -386,23 +386,27 @@ def soft_delete_media(
     """Move media file to temporary .trash/ storage and mark is_deleted = 1."""
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT file_path, is_deleted, trash_path FROM downloaded_media WHERE media_id = ?",
+        "SELECT media_id, file_path, is_deleted FROM downloaded_media WHERE media_id = ?",
         (media_id,),
     )
     row = cursor.fetchone()
     if not row:
         return False
-    file_path, is_deleted, current_trash = row[0], row[1], row[2]
+    stored_id, file_path, is_deleted = row[0], row[1], row[2]
     if is_deleted:
         return True
 
-    trash_dir = os.path.join(download_dir, ".trash")
+    trash_dir = os.path.realpath(os.path.join(download_dir, ".trash"))
     os.makedirs(trash_dir, exist_ok=True)
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", media_id)
+    # Name the trash file from the stored ID, never the request value, and check the
+    # resolved path inline so the containment guard covers the path that is used.
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", stored_id)
     filename = os.path.basename(file_path) if file_path else f"{safe_id}_file.tmp"
-    target_trash_path = os.path.join(trash_dir, f"{safe_id}_{filename}")
-    if not is_path_within_dir(target_trash_path, trash_dir):
-        logger.error(f"Refusing to move media {media_id}: trash path escapes .trash/")
+    target_trash_path = os.path.realpath(
+        os.path.join(trash_dir, f"{safe_id}_{filename}")
+    )
+    if not target_trash_path.startswith(trash_dir + os.sep):
+        logger.error(f"Refusing to move media {stored_id}: trash path escapes .trash/")
         return False
 
     if file_path and os.path.exists(file_path):
@@ -419,10 +423,10 @@ def soft_delete_media(
     with conn:
         conn.execute(
             "UPDATE downloaded_media SET is_deleted = 1, trash_path = ?, deleted_at = ? WHERE media_id = ?",
-            (target_trash_path, now_iso, media_id),
+            (target_trash_path, now_iso, stored_id),
         )
     logger.info(
-        f"Media {media_id} soft-deleted to temporary trash: {target_trash_path}"
+        f"Media {stored_id} soft-deleted to temporary trash: {target_trash_path}"
     )
     return True
 
