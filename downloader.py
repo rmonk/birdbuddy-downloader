@@ -648,26 +648,69 @@ def get_feeder_download_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Treat naive datetimes as UTC so they compare with aware ones."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def get_recent_sightings(
     conn: sqlite3.Connection,
     days: int = 7,
     limit: int = 0,
     min_bird_confidence: float = 0.25,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    feeders: list[str] | None = None,
+    species: list[str] | None = None,
+    media_types: list[str] | None = None,
+    include_removed: bool = True,
+    min_score: float | None = None,
+    max_score: float | None = None,
+    q: str | None = None,
 ) -> list[dict]:
     """
-    Query media from the past `days` grouped by sighting_id.
+    Query media grouped by sighting_id, newest first.
     Identifies the image with the highest bird likelihood per sighting and includes both active and removed items.
-    """
-    now = datetime.now(timezone.utc)
-    cutoff = (now - timedelta(days=days)).isoformat()
-    cursor = conn.cursor()
 
-    query = """
+    Without filters this returns media downloaded in the past `days` (0 = no limit).
+    Filters:
+    - `start` / `end`: capture time (`created_at`) range, start inclusive, end exclusive.
+      Setting `start` replaces the `days` cutoff.
+    - `feeders` / `species`: display names as returned by `get_filter_options()`.
+    - `media_types`: subset of "image" / "video".
+    - `include_removed`: False hides soft-deleted media.
+    - `min_score` / `max_score` (0-1): range for the sighting's best image bird score;
+      sightings without a scored image are dropped when either bound is set.
+    - `q`: case-insensitive substring of species, feeder, IDs, filename or location.
+    """
+    feeder_expr = "COALESCE(NULLIF(feeder_name, ''), 'Bird Buddy')"
+    species_expr = "COALESCE(NULLIF(species_name, ''), 'Unknown Species')"
+    where = []
+    params: list = []
+    if start is None and days and days > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        where.append("downloaded_at >= ?")
+        params.append(cutoff)
+    if feeders:
+        where.append(f"{feeder_expr} IN ({','.join('?' * len(feeders))})")
+        params.extend(feeders)
+    if species:
+        where.append(f"{species_expr} IN ({','.join('?' * len(species))})")
+        params.extend(species)
+    if media_types:
+        where.append(f"media_type IN ({','.join('?' * len(media_types))})")
+        params.extend(media_types)
+    if not include_removed:
+        where.append("COALESCE(is_deleted, 0) = 0")
+
+    query = f"""
     SELECT
         COALESCE(NULLIF(sighting_id, ''), media_id) as group_sighting_id,
         media_id,
-        COALESCE(NULLIF(feeder_name, ''), 'Bird Buddy') as feeder_name,
-        COALESCE(NULLIF(species_name, ''), 'Unknown Species') as species_name,
+        {feeder_expr} as feeder_name,
+        {species_expr} as species_name,
         media_type,
         created_at,
         downloaded_at,
@@ -676,20 +719,27 @@ def get_recent_sightings(
         bird_detected,
         sharpness_score,
         is_deleted,
-        trash_path
+        trash_path,
+        location_city,
+        location_country
     FROM downloaded_media
-    WHERE downloaded_at >= ?
+    {"WHERE " + " AND ".join(where) if where else ""}
     ORDER BY created_at DESC, downloaded_at DESC
     """
-    cursor.execute(query, (cutoff,))
+    cursor = conn.cursor()
+    cursor.execute(query, params)
     rows = cursor.fetchall()
+
+    start = _as_utc(start)
+    end = _as_utc(end)
+    needle = q.strip().lower() if q and q.strip() else None
 
     sightings_dict = {}
     for row in rows:
         s_id = row[0]
         m_id = row[1]
         fname = row[2]
-        species = row[3]
+        species_name = row[3]
         mtype = row[4]
         c_at = row[5]
         dl_at = row[6]
@@ -699,17 +749,46 @@ def get_recent_sightings(
         sharpness = row[10]
         is_del = bool(row[11])
         tpath = row[12]
+        city = row[13]
+        country = row[14]
+
+        if start is not None or end is not None:
+            captured = _as_utc(parse_iso_datetime(c_at))
+            if captured is None:
+                continue
+            if start is not None and captured < start:
+                continue
+            if end is not None and captured >= end:
+                continue
+
+        filename = (
+            os.path.basename(fpath)
+            if fpath
+            else f"{m_id}.{('jpg' if mtype == 'image' else 'mp4')}"
+        )
+
+        if needle is not None:
+            haystack = " ".join(
+                str(v)
+                for v in (species_name, fname, s_id, m_id, filename, city, country)
+                if v
+            ).lower()
+            if needle not in haystack:
+                continue
 
         if s_id not in sightings_dict:
             sightings_dict[s_id] = {
                 "sighting_id": s_id,
                 "feeder_name": fname,
-                "species_name": species,
+                "species_name": species_name,
                 "created_at": c_at,
                 "latest_downloaded_at": dl_at,
+                "location_city": city,
+                "location_country": country,
                 "images": [],
                 "videos": [],
                 "total_items": 0,
+                "best_score": None,
             }
 
         media_info = {
@@ -723,11 +802,7 @@ def get_recent_sightings(
             "sharpness_score": sharpness,
             "is_deleted": is_del,
             "trash_path": tpath,
-            "filename": (
-                os.path.basename(fpath)
-                if fpath
-                else f"{m_id}.{('jpg' if mtype == 'image' else 'mp4')}"
-            ),
+            "filename": filename,
             "is_best_view": False,
         }
 
@@ -748,6 +823,7 @@ def get_recent_sightings(
                 active_images = [img for img in valid_images if not img["is_deleted"]]
                 pool = active_images if active_images else valid_images
                 max_img = max(pool, key=lambda x: x.get("bird_score") or 0.0)
+                s["best_score"] = max_img.get("bird_score")
                 if (max_img.get("bird_score") or 0.0) >= min_bird_confidence:
                     max_img["is_best_view"] = True
             else:
@@ -755,9 +831,45 @@ def get_recent_sightings(
                 pool = active_images if active_images else images
                 pool[0]["is_best_view"] = True
 
+    if min_score is not None or max_score is not None:
+        sightings_list = [
+            s
+            for s in sightings_list
+            if s["best_score"] is not None
+            and (min_score is None or s["best_score"] >= min_score)
+            and (max_score is None or s["best_score"] <= max_score)
+        ]
+
     if limit > 0:
         return sightings_list[:limit]
     return sightings_list
+
+
+def get_filter_options(conn: sqlite3.Connection) -> dict:
+    """Return the distinct feeders and species in the database plus the capture date range."""
+    cursor = conn.cursor()
+
+    def distinct(expr: str) -> list[str]:
+        cursor.execute(f"SELECT DISTINCT {expr} FROM downloaded_media")
+        return sorted((r[0] for r in cursor.fetchall()), key=str.casefold)
+
+    feeders = distinct("COALESCE(NULLIF(feeder_name, ''), 'Bird Buddy')")
+    species = distinct("COALESCE(NULLIF(species_name, ''), 'Unknown Species')")
+
+    cursor.execute(
+        "SELECT created_at FROM downloaded_media WHERE created_at IS NOT NULL"
+    )
+    dates = [
+        d
+        for d in (_as_utc(parse_iso_datetime(r[0])) for r in cursor.fetchall())
+        if d is not None
+    ]
+    return {
+        "feeders": feeders,
+        "species": species,
+        "date_min": min(dates).isoformat() if dates else None,
+        "date_max": max(dates).isoformat() if dates else None,
+    }
 
 
 def sanitize_filename(name: str) -> str:
@@ -2168,6 +2280,29 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .page-btn:disabled { opacity: 0.35; cursor: not-allowed; }
     .page-size-select { background-color: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border); padding: 3px 6px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; outline: none; }
 
+    /* Sighting Filters */
+    .filter-bar { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: flex-end; margin-bottom: 16px; padding: 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; }
+    .filter-field { display: flex; flex-direction: column; gap: 4px; }
+    .filter-field > label, .filter-field > .filter-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); }
+    .filter-field .input { padding: 6px 8px; font-size: 0.85rem; }
+    .filter-search { flex: 1 1 200px; }
+    .filter-search .input { width: 100%; }
+    .filter-pct { width: 64px; }
+    .filter-range { display: flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 0.85rem; }
+    .filter-check { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-secondary); padding-bottom: 6px; }
+    .filter-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 2px; }
+    .filter-count { font-size: 0.8rem; color: var(--accent); font-weight: 600; }
+    .multi-select { position: relative; }
+    .multi-select-btn { min-width: 160px; max-width: 220px; text-align: left; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .multi-select-btn::after { content: " ▾"; color: var(--text-secondary); }
+    .multi-select-panel { display: none; position: absolute; z-index: 50; top: calc(100% + 4px); left: 0; min-width: 220px; max-height: 300px; overflow-y: auto; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); padding: 6px; }
+    .multi-select.open .multi-select-panel { display: block; }
+    .multi-select-tools { display: flex; justify-content: space-between; gap: 8px; padding: 4px 6px 8px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+    .multi-select-tools button { background: none; border: none; color: #60a5fa; cursor: pointer; font-size: 0.8rem; padding: 0; }
+    .multi-select-option { display: flex; align-items: center; gap: 8px; padding: 5px 6px; font-size: 0.85rem; border-radius: 4px; cursor: pointer; }
+    .multi-select-option:hover { background: var(--bg-card); }
+    .multi-select-empty { padding: 6px; font-size: 0.82rem; color: var(--text-secondary); font-style: italic; }
+
     /* Modal Viewer */
     .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.9); backdrop-filter: blur(4px); justify-content: center; align-items: center; }
     .modal.active { display: flex; }
@@ -2275,8 +2410,51 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <!-- Sighting Event Downloads Section with Top/Bottom Pagination -->
     <div class="section">
       <div class="section-title">
-        <span>📸 Recent Media Downloads (Grouped by Sighting Event)</span>
+        <span>📸 Media Downloads (Grouped by Sighting Event) <span id="sightingsRange" style="font-size: 0.8rem; color: var(--text-secondary); font-weight: normal;"></span></span>
         <div id="topPagination"></div>
+      </div>
+      <div class="filter-bar" id="filterBar">
+        <div class="filter-field filter-search">
+          <label for="filterSearch">Search</label>
+          <input class="input" id="filterSearch" type="search" placeholder="Species, feeder, city, ID, filename...">
+        </div>
+        <div class="filter-field">
+          <label for="filterFrom">From</label>
+          <input class="input" id="filterFrom" type="date">
+        </div>
+        <div class="filter-field">
+          <label for="filterTo">To</label>
+          <input class="input" id="filterTo" type="date">
+        </div>
+        <div class="filter-field">
+          <span class="filter-label">Feeder</span>
+          <div class="multi-select" id="filterFeeders"></div>
+        </div>
+        <div class="filter-field">
+          <span class="filter-label">Bird Type</span>
+          <div class="multi-select" id="filterSpecies"></div>
+        </div>
+        <div class="filter-field">
+          <span class="filter-label">Bird Likelihood %</span>
+          <div class="filter-range">
+            <input class="input filter-pct" id="filterMinScore" type="number" min="0" max="100" step="1" placeholder="0" aria-label="Minimum bird likelihood percent">
+            <span>–</span>
+            <input class="input filter-pct" id="filterMaxScore" type="number" min="0" max="100" step="1" placeholder="100" aria-label="Maximum bird likelihood percent">
+          </div>
+        </div>
+        <div class="filter-field">
+          <label for="filterType">Media</label>
+          <select class="input" id="filterType">
+            <option value="">All</option>
+            <option value="image">Photos</option>
+            <option value="video">Videos</option>
+          </select>
+        </div>
+        <label class="filter-check"><input type="checkbox" id="filterRemoved" checked> Show removed</label>
+        <div class="filter-actions">
+          <span class="filter-count" id="filterCount"></span>
+          <button class="btn btn-secondary btn-small" type="button" onclick="resetFilters()">Reset</button>
+        </div>
       </div>
       <div id="sightingsContainer">
         <div class="empty-state">Loading recent detection sightings...</div>
@@ -2582,6 +2760,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         }
 
         // 7. Render Sighting Event Groups via Pagination
+        await loadFilterOptions();
         await fetchSightings();
 
       } catch (err) {
@@ -2594,6 +2773,252 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     let totalSightings = 0;
     let totalPages = 1;
     let lastRenderedSightingsJson = "";
+
+    // ---- Sighting filters ----
+    function localDateString(d) {
+      const pad = n => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    }
+
+    function parseLocalDate(value) {
+      if (!value) return null;
+      const [y, m, d] = value.split("-").map(Number);
+      if (!y || !m || !d) return null;
+      return new Date(y, m - 1, d);
+    }
+
+    function defaultFromDate() {
+      const d = new Date();
+      d.setDate(d.getDate() - 7);
+      return localDateString(d);
+    }
+
+    function defaultFilters() {
+      return { q: "", from: defaultFromDate(), to: "", feeders: [], species: [], minScore: "", maxScore: "", type: "", removed: true };
+    }
+
+    let filters = defaultFilters();
+    let lastFilterOptionsJson = "";
+
+    function createMultiSelect(id, allLabel, onChange) {
+      const root = document.getElementById(id);
+      root.innerHTML = `<button type="button" class="input multi-select-btn"></button>
+        <div class="multi-select-panel">
+          <div class="multi-select-tools"><button type="button" data-act="all">Select all</button><button type="button" data-act="clear">Clear</button></div>
+          <div class="multi-select-list"></div>
+        </div>`;
+      const btn = root.querySelector(".multi-select-btn");
+      const list = root.querySelector(".multi-select-list");
+      let options = [];
+      let selected = [];
+
+      function updateLabel() {
+        if (selected.length === 0) btn.textContent = allLabel;
+        else if (selected.length === 1) btn.textContent = selected[0];
+        else btn.textContent = `${selected.length} selected`;
+        btn.title = selected.length ? selected.join(", ") : allLabel;
+      }
+
+      function render() {
+        // Keep selections that are not in the database (e.g. from a bookmark) visible so they can be cleared.
+        const values = [...options, ...selected.filter(v => !options.includes(v))];
+        if (values.length === 0) {
+          list.innerHTML = '<div class="multi-select-empty">No values yet</div>';
+        } else {
+          list.innerHTML = values.map(v => `<label class="multi-select-option"><input type="checkbox" value="${escapeHtml(v)}" ${selected.includes(v) ? "checked" : ""}> ${escapeHtml(v)}</label>`).join("");
+        }
+        updateLabel();
+      }
+
+      btn.addEventListener("click", () => {
+        const wasOpen = root.classList.contains("open");
+        document.querySelectorAll(".multi-select.open").forEach(el => el.classList.remove("open"));
+        if (!wasOpen) root.classList.add("open");
+      });
+      list.addEventListener("change", () => {
+        selected = [...list.querySelectorAll("input:checked")].map(i => i.value);
+        updateLabel();
+        onChange(selected);
+      });
+      root.querySelector(".multi-select-tools").addEventListener("click", e => {
+        const act = e.target.dataset.act;
+        if (!act) return;
+        selected = act === "all" ? [...options] : [];
+        render();
+        onChange(selected);
+      });
+
+      return {
+        setOptions(values) { options = values; render(); },
+        setSelected(values) { selected = [...values]; render(); },
+      };
+    }
+
+    const feederSelect = createMultiSelect("filterFeeders", "All feeders", values => { filters.feeders = values; applyFilters(); });
+    const speciesSelect = createMultiSelect("filterSpecies", "All bird types", values => { filters.species = values; applyFilters(); });
+
+    document.addEventListener("click", e => {
+      document.querySelectorAll(".multi-select.open").forEach(el => {
+        if (!el.contains(e.target)) el.classList.remove("open");
+      });
+    });
+
+    function activeFilterCount() {
+      const d = defaultFilters();
+      let n = 0;
+      if (filters.q.trim()) n++;
+      if (filters.from !== d.from || filters.to) n++;
+      if (filters.feeders.length) n++;
+      if (filters.species.length) n++;
+      if (filters.minScore !== "" || filters.maxScore !== "") n++;
+      if (filters.type) n++;
+      if (!filters.removed) n++;
+      return n;
+    }
+
+    function filtersToHash() {
+      const d = defaultFilters();
+      const p = new URLSearchParams();
+      if (filters.q.trim()) p.set("q", filters.q.trim());
+      if (filters.from !== d.from) p.set("from", filters.from || "all");
+      if (filters.to) p.set("to", filters.to);
+      filters.feeders.forEach(v => p.append("feeder", v));
+      filters.species.forEach(v => p.append("species", v));
+      if (filters.minScore !== "") p.set("min", filters.minScore);
+      if (filters.maxScore !== "") p.set("max", filters.maxScore);
+      if (filters.type) p.set("type", filters.type);
+      if (!filters.removed) p.set("removed", "0");
+      return p.toString();
+    }
+
+    function filtersFromHash() {
+      const p = new URLSearchParams(location.hash.slice(1));
+      const f = defaultFilters();
+      if (p.has("q")) f.q = p.get("q");
+      if (p.has("from")) f.from = p.get("from") === "all" ? "" : p.get("from");
+      if (p.has("to")) f.to = p.get("to");
+      f.feeders = p.getAll("feeder");
+      f.species = p.getAll("species");
+      if (p.has("min")) f.minScore = p.get("min");
+      if (p.has("max")) f.maxScore = p.get("max");
+      if (p.has("type")) f.type = p.get("type");
+      if (p.get("removed") === "0") f.removed = false;
+      return f;
+    }
+
+    function syncFilterInputs() {
+      document.getElementById("filterSearch").value = filters.q;
+      document.getElementById("filterFrom").value = filters.from;
+      document.getElementById("filterTo").value = filters.to;
+      document.getElementById("filterMinScore").value = filters.minScore;
+      document.getElementById("filterMaxScore").value = filters.maxScore;
+      document.getElementById("filterType").value = filters.type;
+      document.getElementById("filterRemoved").checked = filters.removed;
+      feederSelect.setSelected(filters.feeders);
+      speciesSelect.setSelected(filters.species);
+    }
+
+    function sightingsQuery() {
+      const p = new URLSearchParams({ days: "0", page: String(currentPage), per_page: String(perPage) });
+      const from = parseLocalDate(filters.from);
+      if (from) p.set("from", from.toISOString());
+      const to = parseLocalDate(filters.to);
+      if (to) {
+        to.setDate(to.getDate() + 1); // the To date is inclusive; the API end is exclusive
+        p.set("to", to.toISOString());
+      }
+      filters.feeders.forEach(v => p.append("feeder", v));
+      filters.species.forEach(v => p.append("species", v));
+      if (filters.minScore !== "") p.set("min_score", filters.minScore);
+      if (filters.maxScore !== "") p.set("max_score", filters.maxScore);
+      if (filters.type) p.set("type", filters.type);
+      if (!filters.removed) p.set("include_removed", "0");
+      if (filters.q.trim()) p.set("q", filters.q.trim());
+      return p.toString();
+    }
+
+    function updateFilterSummary() {
+      const n = activeFilterCount();
+      document.getElementById("filterCount").textContent = n ? `${n} filter${n === 1 ? "" : "s"} active` : "";
+      const fmt = v => parseLocalDate(v).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+      let range;
+      if (filters.from && filters.to) range = `${fmt(filters.from)} – ${fmt(filters.to)}`;
+      else if (filters.from) range = `since ${fmt(filters.from)}`;
+      else if (filters.to) range = `through ${fmt(filters.to)}`;
+      else range = "all dates";
+      document.getElementById("sightingsRange").textContent = `· ${range}`;
+    }
+
+    async function applyFilters() {
+      currentPage = 1;
+      lastRenderedSightingsJson = "";
+      const hash = filtersToHash();
+      history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search);
+      updateFilterSummary();
+      await fetchSightings();
+    }
+
+    function resetFilters() {
+      filters = defaultFilters();
+      syncFilterInputs();
+      applyFilters();
+    }
+
+    async function loadFilterOptions() {
+      try {
+        const resp = await fetch("/api/sightings/filters");
+        if (!resp.ok) throw new Error("HTTP error " + resp.status);
+        const data = await resp.json();
+        const json = JSON.stringify([data.feeders, data.species, data.date_min]);
+        if (json === lastFilterOptionsJson) return;
+        lastFilterOptionsJson = json;
+        feederSelect.setOptions(data.feeders || []);
+        speciesSelect.setOptions(data.species || []);
+        const minDate = data.date_min ? localDateString(new Date(data.date_min)) : "";
+        ["filterFrom", "filterTo"].forEach(id => {
+          const el = document.getElementById(id);
+          el.min = minDate;
+          el.max = localDateString(new Date());
+        });
+      } catch (e) {
+        console.error("Error loading filter options:", e);
+      }
+    }
+
+    function debounce(fn, ms) {
+      let t = null;
+      return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+    }
+
+    function setupFilters() {
+      filters = filtersFromHash();
+      syncFilterInputs();
+      updateFilterSummary();
+
+      const search = document.getElementById("filterSearch");
+      const onSearch = debounce(() => { filters.q = search.value; applyFilters(); }, 300);
+      search.addEventListener("input", onSearch);
+
+      document.getElementById("filterFrom").addEventListener("change", e => { filters.from = e.target.value; applyFilters(); });
+      document.getElementById("filterTo").addEventListener("change", e => { filters.to = e.target.value; applyFilters(); });
+
+      const readPct = el => {
+        if (el.value === "") return "";
+        const v = Math.min(100, Math.max(0, Math.round(Number(el.value))));
+        if (Number.isNaN(v)) return "";
+        if (String(v) !== el.value) el.value = v;
+        return String(v);
+      };
+      const minEl = document.getElementById("filterMinScore");
+      const maxEl = document.getElementById("filterMaxScore");
+      const onScore = debounce(() => { filters.minScore = readPct(minEl); filters.maxScore = readPct(maxEl); applyFilters(); }, 400);
+      minEl.addEventListener("input", onScore);
+      maxEl.addEventListener("input", onScore);
+
+      document.getElementById("filterType").addEventListener("change", e => { filters.type = e.target.value; applyFilters(); });
+      document.getElementById("filterRemoved").addEventListener("change", e => { filters.removed = e.target.checked; applyFilters(); });
+    }
+
 
     function renderPaginationControls() {
       const topContainer = document.getElementById("topPagination");
@@ -2648,7 +3073,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
     async function fetchSightings() {
       try {
-        const url = `/api/sightings?days=7&page=${currentPage}&per_page=${perPage}`;
+        const url = `/api/sightings?${sightingsQuery()}`;
         const resp = await fetch(url);
         if (!resp.ok) throw new Error("HTTP error " + resp.status);
         const data = await resp.json();
@@ -2671,7 +3096,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const container = document.getElementById("sightingsContainer");
       if (!sightings || sightings.length === 0) {
         if (lastRenderedSightingsJson !== "[]") {
-          container.innerHTML = '<div class="empty-state">No sightings recorded in the past week.</div>';
+          container.innerHTML = activeFilterCount()
+            ? '<div class="empty-state">No sightings match these filters.</div>'
+            : '<div class="empty-state">No sightings recorded in the past week.</div>';
           lastRenderedSightingsJson = "[]";
         }
         return;
@@ -2693,6 +3120,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <div class="sighting-info">
               <span class="sighting-species">${escapeHtml(s.species_name)}</span>
               <span class="sighting-feeder">${escapeHtml(s.feeder_name)}</span>
+              ${s.best_score != null ? `<span class="pill pill-img" title="Highest bird likelihood in this sighting">Best ${Math.round(s.best_score * 100)}%</span>` : ''}
               <span class="sighting-id-tag">ID: ${escapeHtml(s.sighting_id.substring(0, 8))}</span>
             </div>
             <div style="font-size: 0.85rem; color: var(--text-secondary);">
@@ -3379,9 +3807,11 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         ["loginModal", "accountModal", "adminModal"].forEach(id => closeDialog(id));
+        document.querySelectorAll(".multi-select.open").forEach(el => el.classList.remove("open"));
       }
     });
 
+    setupFilters();
     refreshAuth().then(loadStatus);
     setupAutoRefresh();
   </script>
@@ -3461,16 +3891,40 @@ async def handle_api_status(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+def _parse_query_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO date or datetime query parameter; raise ValueError if malformed."""
+    if not value:
+        return None
+    dt = parse_iso_datetime(value.strip())
+    if dt is None:
+        raise ValueError(f"Invalid date: {value}")
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _parse_query_percent(value: str | None) -> float | None:
+    """Parse a 0-100 percent query parameter into a 0-1 fraction."""
+    if value is None or value.strip() == "":
+        return None
+    pct = float(value)
+    if not 0 <= pct <= 100:
+        raise ValueError("Percent must be between 0 and 100")
+    return pct / 100.0
+
+
 async def handle_api_sightings(request: web.Request) -> web.Response:
-    """Return recent sightings grouped by sighting_id with pagination."""
+    """Return sightings grouped by sighting_id with filtering and pagination.
+
+    Query parameters: days (0 = no limit), page, per_page, from / to (ISO capture
+    time range, end exclusive), feeder / species (repeatable), type (repeatable:
+    image, video), include_removed (0/1), min_score / max_score (percent), q.
+    """
     downloader: BirdBuddyDownloader = request.app["downloader"]
     min_conf = getattr(downloader.args, "min_bird_confidence", 0.25)
+    query = request.query
     try:
-        days = max(1, int(request.query.get("days", "7")))
-        page = max(1, int(request.query.get("page", "1")))
-        per_page_param = request.query.get("per_page") or request.query.get(
-            "limit", "5"
-        )
+        days = max(0, int(query.get("days", "7")))
+        page = max(1, int(query.get("page", "1")))
+        per_page_param = query.get("per_page") or query.get("limit", "5")
         per_page = max(0, int(per_page_param))
     except ValueError:
         return web.json_response(
@@ -3478,8 +3932,34 @@ async def handle_api_sightings(request: web.Request) -> web.Response:
             status=400,
         )
 
+    try:
+        start = _parse_query_datetime(query.get("from"))
+        end = _parse_query_datetime(query.get("to"))
+        min_score = _parse_query_percent(query.get("min_score"))
+        max_score = _parse_query_percent(query.get("max_score"))
+    except ValueError as e:
+        return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+    media_types = [t for t in query.getall("type", []) if t]
+    if any(t not in ("image", "video") for t in media_types):
+        return web.json_response(
+            {"status": "error", "message": "type must be image or video"}, status=400
+        )
+
     all_sightings = get_recent_sightings(
-        downloader.conn, days=days, limit=0, min_bird_confidence=min_conf
+        downloader.conn,
+        days=days,
+        limit=0,
+        min_bird_confidence=min_conf,
+        start=start,
+        end=end,
+        feeders=[f for f in query.getall("feeder", []) if f] or None,
+        species=[sp for sp in query.getall("species", []) if sp] or None,
+        media_types=media_types or None,
+        include_removed=query.get("include_removed", "1") not in ("0", "false"),
+        min_score=min_score,
+        max_score=max_score,
+        q=query.get("q"),
     )
     total_sightings = len(all_sightings)
 
@@ -3506,6 +3986,12 @@ async def handle_api_sightings(request: web.Request) -> web.Response:
             },
         }
     )
+
+
+async def handle_api_sighting_filters(request: web.Request) -> web.Response:
+    """Return the feeders, species and capture date range available for filtering."""
+    downloader: BirdBuddyDownloader = request.app["downloader"]
+    return web.json_response({"status": "ok", **get_filter_options(downloader.conn)})
 
 
 async def handle_media_view(request: web.Request) -> web.Response:
@@ -3733,6 +4219,7 @@ async def create_web_app(
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_api_status)
     app.router.add_get("/api/sightings", handle_api_sightings)
+    app.router.add_get("/api/sightings/filters", handle_api_sighting_filters)
     app.router.add_get("/api/media/{media_id}/view", handle_media_view)
     app.router.add_get("/api/media/{media_id}/thumb", handle_media_thumb)
     app.router.add_post("/api/media/delete", handle_media_delete)
