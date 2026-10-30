@@ -679,7 +679,8 @@ def get_recent_sightings(
     - `start` / `end`: capture time (`created_at`) range, start inclusive, end exclusive.
       Setting `start` replaces the `days` cutoff.
     - `feeders` / `species`: display names as returned by `get_filter_options()`.
-    - `media_types`: subset of "image" / "video".
+    - `media_types`: subset of "image" / "video". Applied after scoring, so a
+      sighting's best score still comes from its photos when only videos are shown.
     - `include_removed`: False hides soft-deleted media.
     - `min_score` / `max_score` (0-1): range for the sighting's best image bird score;
       sightings without a scored image are dropped when either bound is set.
@@ -699,9 +700,6 @@ def get_recent_sightings(
     if species:
         where.append(f"{species_expr} IN ({','.join('?' * len(species))})")
         params.extend(species)
-    if media_types:
-        where.append(f"media_type IN ({','.join('?' * len(media_types))})")
-        params.extend(media_types)
     if not include_removed:
         where.append("COALESCE(is_deleted, 0) = 0")
 
@@ -839,6 +837,15 @@ def get_recent_sightings(
             and (min_score is None or s["best_score"] >= min_score)
             and (max_score is None or s["best_score"] <= max_score)
         ]
+
+    if media_types:
+        for s in sightings_list:
+            if "image" not in media_types:
+                s["images"] = []
+            if "video" not in media_types:
+                s["videos"] = []
+            s["total_items"] = len(s["images"]) + len(s["videos"])
+        sightings_list = [s for s in sightings_list if s["total_items"]]
 
     if limit > 0:
         return sightings_list[:limit]
@@ -2781,10 +2788,17 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     }
 
     function parseLocalDate(value) {
-      if (!value) return null;
+      if (!value || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value)) return null;
       const [y, m, d] = value.split("-").map(Number);
-      if (!y || !m || !d) return null;
-      return new Date(y, m - 1, d);
+      const date = new Date(y, m - 1, d);
+      // Reject dates that roll over, such as 2026-02-31
+      if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+      return date;
+    }
+
+    function validPercent(value) {
+      if (value == null || !/^[0-9]{1,3}$/.test(value)) return "";
+      return Number(value) <= 100 ? String(Number(value)) : "";
     }
 
     function defaultFromDate() {
@@ -2895,13 +2909,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       const p = new URLSearchParams(location.hash.slice(1));
       const f = defaultFilters();
       if (p.has("q")) f.q = p.get("q");
-      if (p.has("from")) f.from = p.get("from") === "all" ? "" : p.get("from");
-      if (p.has("to")) f.to = p.get("to");
+      // Bookmarks can be edited by hand: drop anything the inputs and API would reject
+      if (p.get("from") === "all") f.from = "";
+      else if (parseLocalDate(p.get("from"))) f.from = p.get("from");
+      if (parseLocalDate(p.get("to"))) f.to = p.get("to");
       f.feeders = p.getAll("feeder");
       f.species = p.getAll("species");
-      if (p.has("min")) f.minScore = p.get("min");
-      if (p.has("max")) f.maxScore = p.get("max");
-      if (p.has("type")) f.type = p.get("type");
+      f.minScore = validPercent(p.get("min"));
+      f.maxScore = validPercent(p.get("max"));
+      if (["image", "video"].includes(p.get("type"))) f.type = p.get("type");
       if (p.get("removed") === "0") f.removed = false;
       return f;
     }
@@ -3071,12 +3087,18 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       await fetchSightings();
     }
 
+    let sightingsRequestSeq = 0;
+
     async function fetchSightings() {
+      // Only the newest request may render, so a slow older response can't replace newer results
+      const seq = ++sightingsRequestSeq;
       try {
         const url = `/api/sightings?${sightingsQuery()}`;
         const resp = await fetch(url);
+        if (seq !== sightingsRequestSeq) return;
         if (!resp.ok) throw new Error("HTTP error " + resp.status);
         const data = await resp.json();
+        if (seq !== sightingsRequestSeq) return;
 
         if (data.pagination) {
           totalSightings = data.pagination.total_sightings;
