@@ -150,6 +150,17 @@ class SightingsFilterTest(unittest.TestCase):
             {"s1": 0.9, "s2": 0.3, "s3": 0.6, "s4": None},
         )
 
+    def test_score_filter_with_videos_uses_photo_scores(self):
+        sightings = get_recent_sightings(
+            self.conn, media_types=["video"], min_score=0.5
+        )
+        self.assertEqual([s["sighting_id"] for s in sightings], ["s1"])
+        s1 = sightings[0]
+        self.assertEqual(s1["best_score"], 0.9)
+        self.assertEqual(s1["images"], [])
+        self.assertEqual([m["media_id"] for m in s1["videos"]], ["m3"])
+        self.assertEqual(s1["total_items"], 1)
+
     def test_text_search(self):
         self.assertEqual(self.ids(q="denver"), ["s2"])
         self.assertEqual(self.ids(q="  ROBIN "), ["s4", "s1"])
